@@ -1,0 +1,38 @@
+error: rustc interrupted by SIGSEGV, printing backtrace
+
+/home/donovan/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/librustc_driver-277627f6f3b9f29c.so(+0x399a39f) [0x77c1ab39a39f]
+/lib/x86_64-linux-gnu/libc.so.6(+0x458d0) [0x77c1a76458d0]
+/home/donovan/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/librustc_driver-277627f6f3b9f29c.so(+0x5812512) [0x77c1ad212512]
+/home/donovan/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/librustc_driver-277627f6f3b9f29c.so(+0x5d5bc2e) [0x77c1ad75bc2e]
+/home/donovan/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/librustc_driver-277627f6f3b9f29c.so(+0x5d5a3a3) [0x77c1ad75a3a3]
+/home/donovan/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/librustc_driver-277627f6f3b9f29c.so(_RINvNtNtCs6ft1E8XzW5M_18rustc_query_system5query8plumbing17try_execute_queryINtCs9x722ZPFaHd_16rustc_query_impl13DynamicConfigINtNtB4_6caches10DefIdCacheINtNtNtCs1tA37ULJ6jU_12rustc_middle5query5erase6ErasedAhj18_EEKb0_KB3s_KB3s_ENtNtB1f_8plumbing9QueryCtxtKB3s_EB1f_+0x66e) [0x77c1acc02a2e]
+/home/donovan/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/librustc_driver-277627f6f3b9f29c.so(+0x520236a) [0x77c1acc0236a]
+/home/donovan/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/librustc_driver-277627f6f3b9f29c.so(+0x5201926) [0x77c1acc01926]
+/home/donovan/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/librustc_driver-277627f6f3b9f29c.so(_RINvNtNtCs6ft1E8XzW5M_18rustc_query_system5query8plumbing17try_execute_queryINtCs9x722ZPFaHd_16rustc_query_impl13DynamicConfigINtNtB4_6caches10DefIdCacheINtNtNtCs1tA37ULJ6jU_12rustc_middle5query5erase6ErasedAhj18_EEKb0_KB3s_KB3s_ENtNtB1f_8plumbing9QueryCtxtKB3s_EB1f_+0x64f) [0x77c1acc02a0f]
+/home/donovan/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/librustc_driver-277627f6f3b9f29c.so(+0x520226a) [0x77c1acc0226a]
+/home/donovan/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/librustc_driver-277627f6f3b9f29c.so(_RNvXs_NtCs7LTqItT3XUc_18rustc_hir_analysis7collectNtB4_23CollectItemTypesVisitorNtNtCs9bomkzvVmyl_9rustc_hir10intravisit7Visitor10visit_item+0x25e) [0x77c1ad221c1e]
+/home/donovan/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/librustc_driver-277627f6f3b9f29c.so(_RNvNtNtCs7LTqItT3XUc_18rustc_hir_analysis5check7wfcheck17check_well_formed+0x1e9) [0x77c1ad217237]
+/home/donovan/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/librustc_driver-277627f6f3b9f29c.so(+0x581704b) [0x77c1ad21704b]
+/home/donovan/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/librustc_driver-277627f6f3b9f29c.so(_RINvNtNtCs6ft1E8XzW5M_18rustc_query_system5query8plumbing17try_execute_queryINtCs9x722ZPFaHd_16rustc_query_impl13DynamicConfigINtNtCsjqr20crPvj3_21rustc_data_structures9vec_cache8VecCacheNtNtCs2HzebgV0Iwc_10rustc_span6def_id10LocalDefIdINtNtNtCs1tA37ULJ6jU_12rustc_middle5query5erase6ErasedAhj1_ENtNtNtB6_9dep_graph5graph12DepNodeIndexEKb0_KB5p_KB5p_ENtNtB1f_8plumbing9QueryCtxtKB5p_EB1f_+0x4f1) [0x77c1ad2168f1]
+/home/donovan/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/librustc_driver-277627f6f3b9f29c.so(+0x58163e6) [0x77c1ad2163e6]
+/home/donovan/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/librustc_driver-277627f6f3b9f29c.so(_RNvNtNtCs7LTqItT3XUc_18rustc_hir_analysis5check7wfcheck17check_mod_type_wf+0x1e5) [0x77c1ad213965]
+/home/donovan/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/librustc_driver-277627f6f3b9f29c.so(+0x581375f) [0x77c1ad21375f]
+/home/donovan/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/librustc_driver-277627f6f3b9f29c.so(_RINvNtNtCs6ft1E8XzW5M_18rustc_query_system5query8plumbing17try_execute_queryINtCs9x722ZPFaHd_16rustc_query_impl13DynamicConfigINtNtB4_6caches12DefaultCacheNtNtCs2HzebgV0Iwc_10rustc_span6def_id13LocalModDefIdINtNtNtCs1tA37ULJ6jU_12rustc_middle5query5erase6ErasedAhj1_EEKb0_KB4j_KB4j_ENtNtB1f_8plumbing9QueryCtxtKB4j_EB1f_+0x244) [0x77c1ad9eda84]
+/home/donovan/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/librustc_driver-277627f6f3b9f29c.so(+0x5fed811) [0x77c1ad9ed811]
+/home/donovan/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/librustc_driver-277627f6f3b9f29c.so(_RNvCs7LTqItT3XUc_18rustc_hir_analysis11check_crate+0x132) [0x77c1acdc6f72]
+/home/donovan/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/librustc_driver-277627f6f3b9f29c.so(+0x59e0237) [0x77c1ad3e0237]
+/home/donovan/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/librustc_driver-277627f6f3b9f29c.so(_RNvNtCse6cwSMMpF1o_15rustc_interface6passes8analysis+0x1e) [0x77c1ad8edb5e]
+/home/donovan/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/librustc_driver-277627f6f3b9f29c.so(+0x5eedb35) [0x77c1ad8edb35]
+/home/donovan/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/librustc_driver-277627f6f3b9f29c.so(_RINvNtNtCs6ft1E8XzW5M_18rustc_query_system5query8plumbing17try_execute_queryINtCs9x722ZPFaHd_16rustc_query_impl13DynamicConfigINtNtB4_6caches11SingleCacheINtNtNtCs1tA37ULJ6jU_12rustc_middle5query5erase6ErasedAhj0_EEKb0_KB3s_KB3s_ENtNtB1f_8plumbing9QueryCtxtKB3s_EB1f_+0x1f0) [0x77c1ad8efc3a]
+/home/donovan/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/librustc_driver-277627f6f3b9f29c.so(+0x5eef90f) [0x77c1ad8ef90f]
+/home/donovan/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/librustc_driver-277627f6f3b9f29c.so(+0x61aa0c7) [0x77c1adbaa0c7]
+/home/donovan/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/librustc_driver-277627f6f3b9f29c.so(+0x60fe966) [0x77c1adafe966]
+/home/donovan/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/librustc_driver-277627f6f3b9f29c.so(+0x60b523e) [0x77c1adab523e]
+/home/donovan/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/librustc_driver-277627f6f3b9f29c.so(+0x60b56b4) [0x77c1adab56b4]
+/home/donovan/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/librustc_driver-277627f6f3b9f29c.so(+0x60b6aab) [0x77c1adab6aab]
+/lib/x86_64-linux-gnu/libc.so.6(+0xa27f1) [0x77c1a76a27f1]
+/lib/x86_64-linux-gnu/libc.so.6(+0x133c9c) [0x77c1a7733c9c]
+
+note: we would appreciate a report at https://github.com/rust-lang/rust
+help: you can increase rustc's stack size by setting RUST_MIN_STACK=16777216
+note: backtrace dumped due to SIGSEGV! resuming signal
