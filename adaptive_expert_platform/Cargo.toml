@@ -55,6 +55,7 @@ chrono = { version = "0.4", features = ["serde"] }
 config = "0.14"
 clap = { version = "4.4", features = ["derive"] }
 toml = "0.8"
+rpassword = "7.3"
 
 # File system operations and monitoring
 notify = "6.1"
@@ -81,6 +82,37 @@ redis = { version = "0.25", optional = true }
 bb8 = { version = "0.8", optional = true }
 bb8-redis = { version = "0.14", optional = true }
 
+# Advanced features
+uuid = { version = "1.10", features = ["v4", "serde"] }
+dashmap = "6.1"
+parking_lot = "0.12"
+crossbeam = "0.8"
+rayon = "1.10"
+lru = "0.12"
+bloom = "0.3"
+ahash = "0.8"
+fnv = "1.0"
+
+# Vector search and embeddings
+candle-core = { version = "0.7", optional = true }
+candle-nn = { version = "0.7", optional = true }
+hnsw_rs = { version = "0.3", optional = true }
+ndarray = { version = "0.16", optional = true }
+faiss = { version = "0.12", optional = true }
+
+# Monitoring and metrics
+prometheus = { version = "0.13", optional = true }
+metrics = { version = "0.23", optional = true }
+metrics-exporter-prometheus = { version = "0.15", optional = true }
+
+# WebSocket support  
+axum-extra = { version = "0.9", features = ["ws"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "limit", "compression", "fs"] }
+
+# Configuration enhancements
+etcd-rs = { version = "1.0", optional = true }
+consul = { version = "0.4", optional = true }
+
 [dev-dependencies]
 # Testing infrastructure
 tokio-test = "0.4"
@@ -104,3 +136,7 @@ with-observability = [
   "dep:tracing-opentelemetry",
   "dep:opentelemetry-otlp",
 ]
+with-vector-search = ["dep:hnsw_rs", "dep:ndarray", "dep:candle-core", "dep:candle-nn"]
+with-faiss = ["dep:faiss"]
+with-metrics = ["dep:prometheus", "dep:metrics", "dep:metrics-exporter-prometheus"]
+with-distributed = ["dep:etcd-rs", "dep:consul"]

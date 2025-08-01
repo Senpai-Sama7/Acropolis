@@ -1,0 +1,151 @@
+ou are acting as a full-stack AI software engineer and security auditor. Your task is to automatically audit and refactor the Acropolis codebase (Senpai-Sama7/Acropolis) to resolve all major issues identified in a prior deep audit. This includes security, performance, maintainability, and dependency risks. Follow the checklist below to fix them precisely, in order. Provide inline doc comments for changes, and commit logically grouped changes with clear messages.
+
+✅ SECURITY FIXES
+Default Credentials:
+
+Remove all hardcoded passwords and users from startup logic.
+
+Require admin user creation at first launch via CLI or setup wizard.
+
+If defaults must remain for dev, ensure they are disabled in production builds.
+
+JWT Secret Enforcement:
+
+Refactor to halt startup if AEP_JWT_SECRET is missing, weak, or uses known default.
+
+Add entropy check for secret length and randomness.
+
+Julia Sandbox Restriction:
+
+Implement a strict allowlist of callable Julia function names (e.g. ["main", "run_model", "predict"]).
+
+Validate against it before dynamic function execution.
+
+Python Subprocess Cleanup:
+
+Modify the PythonToolAgent to terminate subprocesses if they exceed timeout (handle Child properly).
+
+Prevent zombie processes.
+
+Command Input Validation:
+
+Harden all Command::new usages by:
+
+Checking paths
+
+Disallowing user-controlled shell expansions
+
+Sanitizing CLI args
+
+Plugin Signature Verification:
+
+Enforce SHA-256 signature checks by default. Refactor to fail hard if plugin signatures are missing or disabled without a --insecure override flag.
+
+Remove or quarantine unsigned plugins on disk.
+
+Secure Dockerfile:
+
+Add GPG signature verification for Julia tarball.
+
+Strip unnecessary build tools from final image.
+
+Ensure USER is never root in any layer.
+
+✅ PERFORMANCE FIXES
+Task Throttling:
+
+Enforce max_concurrent_tasks using a Semaphore or bounded queue in the Orchestrator.
+
+Julia Concurrency:
+
+If high-throughput Julia is required, allow optional multiple runtime threads via config.
+
+Queue requests with backpressure.
+
+Memory Index Optimization:
+
+Refactor vector memory to use HNSWlib (via hnsw_rs crate) or Faiss wrapper.
+
+Replace brute-force cosine scan with indexed nearest neighbor search for ≥10K fragments.
+
+LLM Session Streaming:
+
+Enable streaming responses from llama.cpp using enable_streaming config.
+
+Stream output tokens progressively back to client.
+
+✅ CODE QUALITY & MAINTAINABILITY
+Remove Legacy Code:
+
+Delete or archive the entire .bak/ directory and any duplicate .rs source files at the repo root.
+
+Remove any .d files or target/ artifacts in version control.
+
+Centralize Magic Numbers:
+
+Replace all hardcoded timeouts, fragment limits, etc., with named constants or pull from config.
+
+Refactor Modular Boundaries:
+
+Simplify crate-level boundaries if redundant (e.g. move duplicated agent.rs, orchestrator.rs logic into primary crate cleanly).
+
+Improve Error Messages:
+
+Add context to anyhow!() messages across all .await? calls, especially around plugin loading, script execution, and auth failures.
+
+✅ DEPENDENCY RISK REDUCTION
+Audit and Patch Dependencies:
+
+Run cargo audit and cargo deny check bans advisories licenses and resolve all flagged issues.
+
+Upgrade or replace crates with known CVEs.
+
+Ensure no use of deprecated crates like openssl.
+
+Remove Unused GUI/Node Artifacts:
+
+If the GUI is not actively used, delete:
+
+gui/, tailwind.config.js, vite.config.js, and package.json.
+
+Otherwise, run npm audit fix and update all front-end packages.
+
+Julia, Python, Redis Versions:
+
+Pin Dockerfile versions for Julia, Python, and Redis clients to secure, recent LTS versions.
+
+Where Redis is used, enforce TLS connection (rediss://), or explicitly document safe localhost-only usage.
+
+✅ BEST PRACTICE ENHANCEMENTS
+Improve Observability:
+
+Ensure all agent executions include #[instrument] with key metadata (agent_name, task_id, start_time).
+
+Add structured logs for all failures or warnings, including plugin signature failures, rate limit triggers, etc.
+
+Enforce Secure Defaults:
+
+Refactor Config::default() and SecurityConfig to:
+
+Enable auth, rate-limiting, plugin signing, and path isolation by default.
+
+Disable CORS by default unless explicitly set.
+
+Tests and CI Hardening:
+
+Ensure:
+
+CI runs cargo deny, cargo audit, and cargo clippy --deny warnings
+
+Unit tests cover plugin signature rejections, timeout enforcement, and invalid script execution attempts.
+
+🔧 DELIVERABLE
+Once all changes are made, re-run tests and submit with a changelog summarizing the above categories. Confirm that:
+
+The system runs securely by default
+
+No tests fail
+
+No panics or zombie processes occur under load
+
+No hardcoded secrets or dead code remain

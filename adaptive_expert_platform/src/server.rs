@@ -424,10 +424,8 @@ fn create_dummy_memory() -> Memory {
 pub async fn serve(settings: &Settings) -> Result<()> {
     info!("Starting HTTP server on port {}", settings.server.port);
 
-    // Validate security configuration
-    if settings.security.enable_authentication && settings.security.jwt_secret.is_none() {
-        return Err(anyhow::anyhow!("JWT secret must be provided when authentication is enabled"));
-    }
+    // Enforce strict JWT secret validation
+    validate_jwt_secret_startup(settings)?;
 
     // Create application state
     let memory = Arc::new(create_dummy_memory());
@@ -439,13 +437,15 @@ pub async fn serve(settings: &Settings) -> Result<()> {
             })?
     ));
 
-    // Initialize authentication manager
-    let jwt_secret = settings.security.jwt_secret.clone()
-        .unwrap_or_else(|| {
-            warn!("No JWT secret provided, using default (INSECURE for production)");
-            "default_insecure_secret_change_in_production".to_string()
-        });
+    // Initialize authentication manager with validated JWT secret
+    let jwt_secret = get_jwt_secret_for_server(settings)?;
     let auth_manager = Arc::new(AuthManager::new(jwt_secret));
+    
+    // Check admin initialization
+    if settings.security.enable_authentication && !auth_manager.has_admin().await {
+        error!("No admin user found. Run 'acropolis-cli init-admin' to create the first admin user.");
+        return Err(anyhow::anyhow!("Admin user must be initialized before starting the server"));
+    }
 
     // Initialize rate limiter
     let rate_limiter = create_rate_limiter(&settings.security);
@@ -468,8 +468,10 @@ pub async fn serve(settings: &Settings) -> Result<()> {
     info!("HTTP server listening on {}", addr);
 
     // Start server with graceful shutdown
-    let server = axum::Server::bind(&addr)
-        .serve(app.into_make_service());
+    let listener = tokio::net::TcpListener::bind(&addr).await
+        .map_err(|e| anyhow::anyhow!("Failed to bind to address: {}", e))?;
+    
+    let server = axum::serve(listener, app);
 
     // Wait for shutdown signal
     let graceful = server.with_graceful_shutdown(wait_for_shutdown());
@@ -505,4 +507,51 @@ async fn wait_for_shutdown() {
         // For Windows, we can use a simple approach
         tokio::time::sleep(tokio::time::Duration::from_secs(u64::MAX)).await;
     }
+}
+
+/// Validate JWT secret meets security requirements for server startup
+fn validate_jwt_secret_startup(settings: &Settings) -> Result<()> {
+    // First check if JWT secret is required
+    if settings.security.enable_authentication {
+        let jwt_secret = get_jwt_secret_for_server(settings)?;
+        
+        // Check minimum length
+        if jwt_secret.len() < 32 {
+            return Err(anyhow::anyhow!("JWT secret must be at least 32 characters long"));
+        }
+        
+        // Check for default/weak secrets
+        let weak_secrets = [
+            "default_insecure_secret_change_in_production",
+            "secret",
+            "jwt_secret", 
+            "change_me",
+            "insecure",
+        ];
+        
+        if weak_secrets.contains(&jwt_secret.as_str()) {
+            return Err(anyhow::anyhow!(
+                "JWT secret is using a known weak value. Please set AEP_JWT_SECRET environment variable with a strong, random secret."
+            ));
+        }
+        
+        // Basic entropy check
+        let unique_chars: std::collections::HashSet<char> = jwt_secret.chars().collect();
+        if unique_chars.len() < 4 {
+            return Err(anyhow::anyhow!(
+                "JWT secret lacks sufficient entropy. Use a random, complex secret."
+            ));
+        }
+    }
+    
+    Ok(())
+}
+
+/// Get JWT secret for server startup
+fn get_jwt_secret_for_server(settings: &Settings) -> Result<String> {
+    settings.security.jwt_secret.clone()
+        .or_else(|| std::env::var("AEP_JWT_SECRET").ok())
+        .ok_or_else(|| anyhow::anyhow!(
+            "JWT secret must be provided via AEP_JWT_SECRET environment variable or config file when authentication is enabled"
+        ))
 }

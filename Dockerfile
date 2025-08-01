@@ -1,7 +1,7 @@
 # ============================
 #  BUILDER STAGE
 # ============================
-FROM rust:1.81-slim AS builder
+FROM rust:1.81.0-slim-bookworm AS builder
 
 # Create non-root user for build process
 RUN groupadd -r builduser && useradd -r -g builduser builduser
@@ -20,17 +20,30 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/* && \
     apt-get clean
 
-# Download and install Julia with signature verification
-# Using Julia 1.9.4 for compatibility with jlrs
+# Download and install Julia with GPG signature verification
+# Using Julia 1.9.4 LTS for stability and security
 ENV JULIA_VERSION=1.9.4
 ENV JULIA_DIR="/opt/julia-${JULIA_VERSION}"
+ENV JULIA_GPG_KEY="3673DF529D9049477F76B37566E3C7DC03D6E495"
 
-RUN wget -qO /tmp/julia.tar.gz \
+RUN apt-get update && apt-get install -y --no-install-recommends gnupg2 && \
+    # Import Julia GPG key
+    gpg --keyserver keyserver.ubuntu.com --recv-keys ${JULIA_GPG_KEY} && \
+    # Download Julia tarball and signature
+    wget -qO /tmp/julia.tar.gz \
       "https://julialang-s3.julialang.org/bin/linux/x64/1.9/julia-${JULIA_VERSION}-linux-x86_64.tar.gz" && \
-    # TODO: Add GPG signature verification here in production
+    wget -qO /tmp/julia.tar.gz.asc \
+      "https://julialang-s3.julialang.org/bin/linux/x64/1.9/julia-${JULIA_VERSION}-linux-x86_64.tar.gz.asc" && \
+    # Verify GPG signature
+    gpg --verify /tmp/julia.tar.gz.asc /tmp/julia.tar.gz && \
+    # Extract and install
     tar -xzf /tmp/julia.tar.gz -C /opt && \
     ln -s "${JULIA_DIR}/bin/julia" /usr/local/bin/julia && \
-    rm /tmp/julia.tar.gz && \
+    # Cleanup
+    rm /tmp/julia.tar.gz /tmp/julia.tar.gz.asc && \
+    apt-get remove -y gnupg2 && \
+    apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/* && \
     # Test Julia installation
     julia --version
 
@@ -56,13 +69,16 @@ COPY --chown=builduser:builduser plugins ./plugins
 # Build with security-focused flags
 ENV RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=static"
 RUN cargo build --release --features "llama julia" && \
-    # Strip debug symbols to reduce binary size
-    strip target/release/acropolis-cli
+    # Strip debug symbols to reduce binary size and remove build tools
+    strip target/release/acropolis-cli && \
+    # Clean up build artifacts and tools that shouldn't be in final image
+    cargo clean && \
+    rm -rf ~/.cargo/registry ~/.cargo/git
 
 # ============================
 #  RUNTIME STAGE
 # ============================
-FROM debian:bookworm-slim AS runtime
+FROM debian:12.8-slim AS runtime
 
 # Security: Create non-root user for runtime
 RUN groupadd -r acropolis && \
@@ -83,15 +99,29 @@ RUN apt-get update && \
     # Remove package manager cache and unnecessary files
     rm -rf /var/cache/apt/* /var/log/* /tmp/* /var/tmp/*
 
-# Install Julia runtime (same version as builder)
+# Install Julia runtime with GPG verification (same version as builder)
 ENV JULIA_VERSION=1.9.4
 ENV JULIA_DIR="/opt/julia-${JULIA_VERSION}"
+ENV JULIA_GPG_KEY="3673DF529D9049477F76B37566E3C7DC03D6E495"
 
-RUN wget -qO /tmp/julia.tar.gz \
+RUN apt-get update && apt-get install -y --no-install-recommends gnupg2 && \
+    # Import Julia GPG key
+    gpg --keyserver keyserver.ubuntu.com --recv-keys ${JULIA_GPG_KEY} && \
+    # Download Julia tarball and signature
+    wget -qO /tmp/julia.tar.gz \
       "https://julialang-s3.julialang.org/bin/linux/x64/1.9/julia-${JULIA_VERSION}-linux-x86_64.tar.gz" && \
+    wget -qO /tmp/julia.tar.gz.asc \
+      "https://julialang-s3.julialang.org/bin/linux/x64/1.9/julia-${JULIA_VERSION}-linux-x86_64.tar.gz.asc" && \
+    # Verify GPG signature
+    gpg --verify /tmp/julia.tar.gz.asc /tmp/julia.tar.gz && \
+    # Extract and install
     tar -xzf /tmp/julia.tar.gz -C /opt && \
     ln -s "${JULIA_DIR}/bin/julia" /usr/local/bin/julia && \
-    rm /tmp/julia.tar.gz && \
+    # Cleanup GPG and temporary files
+    rm /tmp/julia.tar.gz /tmp/julia.tar.gz.asc && \
+    apt-get remove -y gnupg2 && \
+    apt-get autoremove -y && \
+    rm -rf /var/lib/apt/lists/* && \
     julia --version
 
 # Create application directories with proper permissions

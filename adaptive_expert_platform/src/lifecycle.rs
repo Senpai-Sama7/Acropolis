@@ -1,0 +1,858 @@
+//! Advanced agent lifecycle management system
+
+use anyhow::{anyhow, Result};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
+use tokio::sync::{RwLock, mpsc, oneshot, Semaphore};
+use uuid::Uuid;
+use serde::{Deserialize, Serialize};
+use dashmap::DashMap;
+use tokio::process::Command;
+use tracing::{info, warn, error, instrument, debug};
+
+use crate::agent::Agent;
+
+/// Agent lifecycle states
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum AgentState {
+    /// Agent is being deployed
+    Deploying,
+    /// Agent is initializing
+    Initializing,
+    /// Agent is healthy and running
+    Running,
+    /// Agent is experiencing issues but still functional
+    Degraded,
+    /// Agent is not responding
+    Unhealthy,
+    /// Agent is being gracefully shut down
+    Stopping,
+    /// Agent has been stopped
+    Stopped,
+    /// Agent deployment failed
+    Failed,
+    /// Agent is being updated
+    Updating,
+    /// Agent is scaling (creating/destroying instances)
+    Scaling,
+}
+
+/// Agent deployment configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentDeploymentConfig {
+    pub name: String,
+    pub agent_type: String,
+    pub version: String,
+    pub replicas: u32,
+    pub min_replicas: u32,
+    pub max_replicas: u32,
+    pub resource_limits: ResourceLimits,
+    pub health_check: HealthCheckConfig,
+    pub restart_policy: RestartPolicy,
+    pub environment: HashMap<String, String>,
+    pub startup_timeout_secs: u64,
+    pub shutdown_timeout_secs: u64,
+    pub auto_scaling: AutoScalingConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceLimits {
+    pub cpu_cores: f64,
+    pub memory_mb: u64,
+    pub disk_mb: u64,
+    pub network_mbps: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthCheckConfig {
+    pub enabled: bool,
+    pub interval_secs: u64,
+    pub timeout_secs: u64,
+    pub failure_threshold: u32,
+    pub success_threshold: u32,
+    pub initial_delay_secs: u64,
+    pub endpoint: Option<String>,
+    pub command: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RestartPolicy {
+    Never,
+    OnFailure,
+    Always,
+    UnlessStopped,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoScalingConfig {
+    pub enabled: bool,
+    pub target_cpu_percent: f64,
+    pub target_memory_percent: f64,
+    pub scale_up_threshold: f64,
+    pub scale_down_threshold: f64,
+    pub scale_up_cooldown_secs: u64,
+    pub scale_down_cooldown_secs: u64,
+    pub metrics_window_secs: u64,
+}
+
+/// Agent instance information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentInstance {
+    pub id: Uuid,
+    pub deployment_name: String,
+    pub state: AgentState,
+    pub started_at: SystemTime,
+    pub last_health_check: Option<SystemTime>,
+    pub health_status: HealthStatus,
+    pub restart_count: u32,
+    pub resource_usage: ResourceUsage,
+    pub version: String,
+    pub endpoint: Option<String>,
+    pub metadata: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum HealthStatus {
+    Healthy,
+    Warning,
+    Critical,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceUsage {
+    pub cpu_percent: f64,
+    pub memory_mb: u64,
+    pub disk_mb: u64,
+    pub network_in_mbps: f64,
+    pub network_out_mbps: f64,
+}
+
+/// Deployment event for tracking changes
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeploymentEvent {
+    pub id: Uuid,
+    pub deployment_name: String,
+    pub instance_id: Option<Uuid>,
+    pub event_type: DeploymentEventType,
+    pub timestamp: SystemTime,
+    pub message: String,
+    pub metadata: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DeploymentEventType {
+    DeploymentStarted,
+    DeploymentCompleted,
+    DeploymentFailed,
+    InstanceStarted,
+    InstanceStopped,
+    InstanceFailed,
+    InstanceHealthCheckFailed,
+    ScalingUp,
+    ScalingDown,
+    ConfigurationUpdated,
+    RollbackStarted,
+    RollbackCompleted,
+}
+
+/// Agent lifecycle management system
+pub struct LifecycleManager {
+    deployments: Arc<DashMap<String, AgentDeploymentConfig>>,
+    instances: Arc<DashMap<Uuid, AgentInstance>>,
+    agents: Arc<DashMap<Uuid, Arc<dyn Agent>>>,
+    events: Arc<RwLock<Vec<DeploymentEvent>>>,
+    health_checks: Arc<DashMap<Uuid, HealthCheckState>>,
+    scaling_decisions: Arc<DashMap<String, ScalingDecision>>,
+    resource_monitor: Arc<ResourceMonitor>,
+    deployment_semaphore: Arc<Semaphore>,
+    config: LifecycleConfig,
+}
+
+#[derive(Debug)]
+struct HealthCheckState {
+    consecutive_failures: u32,
+    consecutive_successes: u32,
+    last_check: SystemTime,
+    checking: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ScalingDecision {
+    deployment_name: String,
+    target_replicas: u32,
+    last_scale_action: SystemTime,
+    cooldown_until: SystemTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LifecycleConfig {
+    pub max_concurrent_deployments: usize,
+    pub event_retention_hours: u64,
+    pub health_check_worker_count: usize,
+    pub resource_monitoring_interval_secs: u64,
+    pub auto_scaling_interval_secs: u64,
+    pub deployment_timeout_secs: u64,
+}
+
+impl Default for LifecycleConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_deployments: 10,
+            event_retention_hours: 168, // 7 days
+            health_check_worker_count: 5,
+            resource_monitoring_interval_secs: 30,
+            auto_scaling_interval_secs: 60,
+            deployment_timeout_secs: 300, // 5 minutes
+        }
+    }
+}
+
+impl LifecycleManager {
+    /// Create a new lifecycle manager
+    pub fn new(config: LifecycleConfig) -> Self {
+        Self {
+            deployments: Arc::new(DashMap::new()),
+            instances: Arc::new(DashMap::new()),
+            agents: Arc::new(DashMap::new()),
+            events: Arc::new(RwLock::new(Vec::new())),
+            health_checks: Arc::new(DashMap::new()),
+            scaling_decisions: Arc::new(DashMap::new()),
+            resource_monitor: Arc::new(ResourceMonitor::new()),
+            deployment_semaphore: Arc::new(Semaphore::new(config.max_concurrent_deployments)),
+            config,
+        }
+    }
+
+    /// Start the lifecycle management system
+    #[instrument(skip(self))]
+    pub async fn start(&self) -> Result<()> {
+        info!("Starting agent lifecycle management system");
+
+        // Start background services
+        self.start_health_check_workers().await;
+        self.start_resource_monitoring().await;
+        self.start_auto_scaling().await;
+        self.start_event_cleanup().await;
+
+        info!("Agent lifecycle management system started successfully");
+        Ok(())
+    }
+
+    /// Deploy a new agent or update existing deployment
+    #[instrument(skip(self, config))]
+    pub async fn deploy_agent(&self, config: AgentDeploymentConfig) -> Result<Vec<Uuid>> {
+        let _permit = self.deployment_semaphore.acquire().await?;
+        
+        info!("Starting deployment of agent '{}'", config.name);
+        
+        self.record_event(DeploymentEvent {
+            id: Uuid::new_v4(),
+            deployment_name: config.name.clone(),
+            instance_id: None,
+            event_type: DeploymentEventType::DeploymentStarted,
+            timestamp: SystemTime::now(),
+            message: format!("Starting deployment of {} replicas", config.replicas),
+            metadata: HashMap::new(),
+        }).await;
+
+        // Store deployment configuration
+        self.deployments.insert(config.name.clone(), config.clone());
+
+        // Deploy specified number of replicas
+        let mut deployed_instances = Vec::new();
+        for replica_index in 0..config.replicas {
+            match self.deploy_instance(&config, replica_index).await {
+                Ok(instance_id) => {
+                    deployed_instances.push(instance_id);
+                }
+                Err(e) => {
+                    error!("Failed to deploy replica {}: {}", replica_index, e);
+                    self.record_event(DeploymentEvent {
+                        id: Uuid::new_v4(),
+                        deployment_name: config.name.clone(),
+                        instance_id: None,
+                        event_type: DeploymentEventType::DeploymentFailed,
+                        timestamp: SystemTime::now(),
+                        message: format!("Failed to deploy replica {}: {}", replica_index, e),
+                        metadata: HashMap::new(),
+                    }).await;
+                }
+            }
+        }
+
+        if deployed_instances.is_empty() {
+            return Err(anyhow!("No instances were successfully deployed"));
+        }
+
+        self.record_event(DeploymentEvent {
+            id: Uuid::new_v4(),
+            deployment_name: config.name.clone(),
+            instance_id: None,
+            event_type: DeploymentEventType::DeploymentCompleted,
+            timestamp: SystemTime::now(),
+            message: format!("Successfully deployed {}/{} replicas", deployed_instances.len(), config.replicas),
+            metadata: HashMap::new(),
+        }).await;
+
+        info!("Deployment completed for agent '{}': {}/{} replicas", 
+              config.name, deployed_instances.len(), config.replicas);
+        
+        Ok(deployed_instances)
+    }
+
+    /// Deploy a single agent instance
+    async fn deploy_instance(&self, config: &AgentDeploymentConfig, replica_index: u32) -> Result<Uuid> {
+        let instance_id = Uuid::new_v4();
+        
+        // Create initial instance record
+        let mut instance = AgentInstance {
+            id: instance_id,
+            deployment_name: config.name.clone(),
+            state: AgentState::Deploying,
+            started_at: SystemTime::now(),
+            last_health_check: None,
+            health_status: HealthStatus::Unknown,
+            restart_count: 0,
+            resource_usage: ResourceUsage {
+                cpu_percent: 0.0,
+                memory_mb: 0,
+                disk_mb: 0,
+                network_in_mbps: 0.0,
+                network_out_mbps: 0.0,
+            },
+            version: config.version.clone(),
+            endpoint: None,
+            metadata: HashMap::new(),
+        };
+
+        instance.metadata.insert("replica_index".to_string(), serde_json::Value::Number(replica_index.into()));
+        
+        self.instances.insert(instance_id, instance);
+
+        // Initialize health check state
+        self.health_checks.insert(instance_id, HealthCheckState {
+            consecutive_failures: 0,
+            consecutive_successes: 0,
+            last_check: SystemTime::now(),
+            checking: false,
+        });
+
+        // Simulate agent creation and startup
+        let startup_result = self.startup_agent_instance(instance_id, config).await;
+        
+        match startup_result {
+            Ok(agent) => {
+                // Store the agent reference
+                self.agents.insert(instance_id, agent);
+                
+                // Update instance state
+                if let Some(mut instance) = self.instances.get_mut(&instance_id) {
+                    instance.state = AgentState::Running;
+                    instance.health_status = HealthStatus::Healthy;
+                }
+
+                self.record_event(DeploymentEvent {
+                    id: Uuid::new_v4(),
+                    deployment_name: config.name.clone(),
+                    instance_id: Some(instance_id),
+                    event_type: DeploymentEventType::InstanceStarted,
+                    timestamp: SystemTime::now(),
+                    message: "Instance started successfully".to_string(),
+                    metadata: HashMap::new(),
+                }).await;
+
+                Ok(instance_id)
+            }
+            Err(e) => {
+                // Update instance state to failed
+                if let Some(mut instance) = self.instances.get_mut(&instance_id) {
+                    instance.state = AgentState::Failed;
+                    instance.health_status = HealthStatus::Critical;
+                }
+
+                self.record_event(DeploymentEvent {
+                    id: Uuid::new_v4(),
+                    deployment_name: config.name.clone(),
+                    instance_id: Some(instance_id),
+                    event_type: DeploymentEventType::InstanceFailed,
+                    timestamp: SystemTime::now(),
+                    message: format!("Instance startup failed: {}", e),
+                    metadata: HashMap::new(),
+                }).await;
+
+                Err(e)
+            }
+        }
+    }
+
+    /// Startup an agent instance (simulated)
+    async fn startup_agent_instance(&self, instance_id: Uuid, config: &AgentDeploymentConfig) -> Result<Arc<dyn Agent>> {
+        debug!("Starting up agent instance {}", instance_id);
+
+        // Update state to initializing
+        if let Some(mut instance) = self.instances.get_mut(&instance_id) {
+            instance.state = AgentState::Initializing;
+        }
+
+        // Simulate startup delay and resource allocation
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // In a real implementation, this would:
+        // 1. Allocate compute resources
+        // 2. Initialize the agent with the specified configuration
+        // 3. Apply resource limits
+        // 4. Set up monitoring and health checks
+        
+        // For now, create a mock agent that implements the Agent trait
+        let agent = Arc::new(MockAgent::new(instance_id, config.clone()));
+        
+        Ok(agent)
+    }
+
+    /// Stop an agent deployment
+    #[instrument(skip(self))]
+    pub async fn stop_deployment(&self, deployment_name: &str) -> Result<()> {
+        info!("Stopping deployment '{}'", deployment_name);
+
+        // Find all instances for this deployment
+        let instance_ids: Vec<Uuid> = self.instances
+            .iter()
+            .filter(|entry| entry.value().deployment_name == deployment_name)
+            .map(|entry| entry.value().id)
+            .collect();
+
+        // Stop each instance
+        for instance_id in instance_ids {
+            if let Err(e) = self.stop_instance(instance_id).await {
+                error!("Failed to stop instance {}: {}", instance_id, e);
+            }
+        }
+
+        // Remove deployment configuration
+        self.deployments.remove(deployment_name);
+
+        info!("Deployment '{}' stopped", deployment_name);
+        Ok(())
+    }
+
+    /// Stop a specific agent instance
+    #[instrument(skip(self))]
+    pub async fn stop_instance(&self, instance_id: Uuid) -> Result<()> {
+        if let Some(mut instance) = self.instances.get_mut(&instance_id) {
+            instance.state = AgentState::Stopping;
+            
+            self.record_event(DeploymentEvent {
+                id: Uuid::new_v4(),
+                deployment_name: instance.deployment_name.clone(),
+                instance_id: Some(instance_id),
+                event_type: DeploymentEventType::InstanceStopped,
+                timestamp: SystemTime::now(),
+                message: "Instance stopping".to_string(),
+                metadata: HashMap::new(),
+            }).await;
+        }
+
+        // Remove agent and cleanup
+        self.agents.remove(&instance_id);
+        self.health_checks.remove(&instance_id);
+
+        // Update instance state
+        if let Some(mut instance) = self.instances.get_mut(&instance_id) {
+            instance.state = AgentState::Stopped;
+        }
+
+        info!("Instance {} stopped", instance_id);
+        Ok(())
+    }
+
+    /// Scale a deployment to the specified number of replicas
+    #[instrument(skip(self))]
+    pub async fn scale_deployment(&self, deployment_name: &str, target_replicas: u32) -> Result<()> {
+        let config = self.deployments.get(deployment_name)
+            .ok_or_else(|| anyhow!("Deployment '{}' not found", deployment_name))?
+            .clone();
+
+        if target_replicas < config.min_replicas || target_replicas > config.max_replicas {
+            return Err(anyhow!(
+                "Target replicas {} outside allowed range ({}-{})", 
+                target_replicas, config.min_replicas, config.max_replicas
+            ));
+        }
+
+        let current_instances: Vec<_> = self.instances
+            .iter()
+            .filter(|entry| {
+                entry.value().deployment_name == deployment_name &&
+                entry.value().state != AgentState::Stopped &&
+                entry.value().state != AgentState::Failed
+            })
+            .collect();
+
+        let current_replicas = current_instances.len() as u32;
+
+        info!("Scaling deployment '{}' from {} to {} replicas", 
+              deployment_name, current_replicas, target_replicas);
+
+        if target_replicas > current_replicas {
+            // Scale up
+            self.record_event(DeploymentEvent {
+                id: Uuid::new_v4(),
+                deployment_name: deployment_name.to_string(),
+                instance_id: None,
+                event_type: DeploymentEventType::ScalingUp,
+                timestamp: SystemTime::now(),
+                message: format!("Scaling up from {} to {} replicas", current_replicas, target_replicas),
+                metadata: HashMap::new(),
+            }).await;
+
+            for replica_index in current_replicas..target_replicas {
+                if let Err(e) = self.deploy_instance(&config, replica_index).await {
+                    error!("Failed to deploy additional replica: {}", e);
+                }
+            }
+        } else if target_replicas < current_replicas {
+            // Scale down
+            self.record_event(DeploymentEvent {
+                id: Uuid::new_v4(),
+                deployment_name: deployment_name.to_string(),
+                instance_id: None,
+                event_type: DeploymentEventType::ScalingDown,
+                timestamp: SystemTime::now(),
+                message: format!("Scaling down from {} to {} replicas", current_replicas, target_replicas),
+                metadata: HashMap::new(),
+            }).await;
+
+            let instances_to_stop = current_replicas - target_replicas;
+            for (i, entry) in current_instances.iter().enumerate() {
+                if i < instances_to_stop as usize {
+                    if let Err(e) = self.stop_instance(entry.value().id).await {
+                        error!("Failed to stop instance during scale down: {}", e);
+                    }
+                }
+            }
+        }
+
+        // Update deployment configuration
+        if let Some(mut config) = self.deployments.get_mut(deployment_name) {
+            config.replicas = target_replicas;
+        }
+
+        info!("Scaling completed for deployment '{}'", deployment_name);
+        Ok(())
+    }
+
+    /// Get deployment status
+    pub async fn get_deployment_status(&self, deployment_name: &str) -> Option<DeploymentStatus> {
+        let config = self.deployments.get(deployment_name)?;
+        
+        let instances: Vec<_> = self.instances
+            .iter()
+            .filter(|entry| entry.value().deployment_name == deployment_name)
+            .map(|entry| entry.value().clone())
+            .collect();
+
+        let healthy_count = instances.iter()
+            .filter(|instance| matches!(instance.health_status, HealthStatus::Healthy))
+            .count() as u32;
+
+        let running_count = instances.iter()
+            .filter(|instance| instance.state == AgentState::Running)
+            .count() as u32;
+
+        Some(DeploymentStatus {
+            name: deployment_name.to_string(),
+            desired_replicas: config.replicas,
+            current_replicas: instances.len() as u32,
+            healthy_replicas: healthy_count,
+            running_replicas: running_count,
+            instances,
+        })
+    }
+
+    /// Get all deployments
+    pub async fn list_deployments(&self) -> Vec<String> {
+        self.deployments.iter().map(|entry| entry.key().clone()).collect()
+    }
+
+    /// Get deployment events
+    pub async fn get_deployment_events(&self, deployment_name: Option<&str>, limit: Option<usize>) -> Vec<DeploymentEvent> {
+        let events = self.events.read().await;
+        let filtered_events: Vec<_> = if let Some(name) = deployment_name {
+            events.iter()
+                .filter(|event| event.deployment_name == name)
+                .cloned()
+                .collect()
+        } else {
+            events.clone()
+        };
+
+        if let Some(limit) = limit {
+            filtered_events.into_iter().take(limit).collect()
+        } else {
+            filtered_events
+        }
+    }
+
+    /// Record a deployment event
+    async fn record_event(&self, event: DeploymentEvent) {
+        let mut events = self.events.write().await;
+        events.push(event);
+
+        // Keep only recent events
+        let cutoff = SystemTime::now() - Duration::from_secs(self.config.event_retention_hours * 3600);
+        events.retain(|event| event.timestamp > cutoff);
+    }
+
+    /// Start health check worker tasks
+    async fn start_health_check_workers(&self) {
+        for worker_id in 0..self.config.health_check_worker_count {
+            let instances = self.instances.clone();
+            let health_checks = self.health_checks.clone();
+            let deployments = self.deployments.clone();
+            
+            tokio::spawn(async move {
+                info!("Starting health check worker {}", worker_id);
+                let mut interval = tokio::time::interval(Duration::from_secs(10));
+                
+                loop {
+                    interval.tick().await;
+                    
+                    for entry in instances.iter() {
+                        let instance_id = entry.key();
+                        let instance = entry.value();
+                        
+                        if let Some(config) = deployments.get(&instance.deployment_name) {
+                            if config.health_check.enabled {
+                                Self::perform_health_check(*instance_id, &instance, &config.health_check, &health_checks).await;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    /// Perform health check on an instance
+    async fn perform_health_check(
+        instance_id: Uuid,
+        instance: &AgentInstance,
+        config: &HealthCheckConfig,
+        health_checks: &DashMap<Uuid, HealthCheckState>,
+    ) {
+        if let Some(mut state) = health_checks.get_mut(&instance_id) {
+            if state.checking {
+                return; // Already checking
+            }
+            state.checking = true;
+        }
+
+        let health_result = if let Some(ref endpoint) = config.endpoint {
+            Self::http_health_check(endpoint, config.timeout_secs).await
+        } else if let Some(ref command) = config.command {
+            Self::command_health_check(command, config.timeout_secs).await
+        } else {
+            // Default health check - just verify the instance is in a good state
+            Ok(instance.state == AgentState::Running)
+        };
+
+        if let Some(mut state) = health_checks.get_mut(&instance_id) {
+            state.last_check = SystemTime::now();
+            state.checking = false;
+
+            match health_result {
+                Ok(true) => {
+                    state.consecutive_successes += 1;
+                    state.consecutive_failures = 0;
+                }
+                Ok(false) | Err(_) => {
+                    state.consecutive_failures += 1;
+                    state.consecutive_successes = 0;
+                }
+            }
+
+            debug!("Health check for instance {}: failures={}, successes={}", 
+                   instance_id, state.consecutive_failures, state.consecutive_successes);
+        }
+    }
+
+    /// Perform HTTP health check
+    async fn http_health_check(endpoint: &str, timeout_secs: u64) -> Result<bool> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(timeout_secs))
+            .build()?;
+
+        match client.get(endpoint).send().await {
+            Ok(response) => Ok(response.status().is_success()),
+            Err(_) => Ok(false),
+        }
+    }
+
+    /// Perform command-based health check
+    async fn command_health_check(command: &[String], timeout_secs: u64) -> Result<bool> {
+        if command.is_empty() {
+            return Ok(false);
+        }
+
+        let mut cmd = Command::new(&command[0]);
+        if command.len() > 1 {
+            cmd.args(&command[1..]);
+        }
+
+        match tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output()).await {
+            Ok(Ok(output)) => Ok(output.status.success()),
+            _ => Ok(false),
+        }
+    }
+
+    /// Start resource monitoring
+    async fn start_resource_monitoring(&self) {
+        let instances = self.instances.clone();
+        let resource_monitor = self.resource_monitor.clone();
+        let interval = self.config.resource_monitoring_interval_secs;
+
+        tokio::spawn(async move {
+            let mut monitoring_interval = tokio::time::interval(Duration::from_secs(interval));
+
+            loop {
+                monitoring_interval.tick().await;
+
+                for mut entry in instances.iter_mut() {
+                    let instance_id = *entry.key();
+                    let instance = entry.value_mut();
+                    
+                    if let Ok(usage) = resource_monitor.get_instance_usage(instance_id).await {
+                        instance.resource_usage = usage;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Start auto-scaling logic
+    async fn start_auto_scaling(&self) {
+        let deployments = self.deployments.clone();
+        let instances = self.instances.clone();
+        let scaling_decisions = self.scaling_decisions.clone();
+        let lifecycle_manager = Arc::new(self.clone()); // This would need proper cloning implementation
+        let interval = self.config.auto_scaling_interval_secs;
+
+        tokio::spawn(async move {
+            let mut scaling_interval = tokio::time::interval(Duration::from_secs(interval));
+
+            loop {
+                scaling_interval.tick().await;
+
+                for entry in deployments.iter() {
+                    let deployment_name = entry.key();
+                    let config = entry.value();
+
+                    if config.auto_scaling.enabled {
+                        // This would implement actual auto-scaling logic
+                        // For now, it's a placeholder
+                        debug!("Auto-scaling evaluation for deployment '{}'", deployment_name);
+                    }
+                }
+            }
+        });
+    }
+
+    /// Start event cleanup task
+    async fn start_event_cleanup(&self) {
+        let events = self.events.clone();
+        let retention_hours = self.config.event_retention_hours;
+
+        tokio::spawn(async move {
+            let mut cleanup_interval = tokio::time::interval(Duration::from_secs(3600)); // Run every hour
+
+            loop {
+                cleanup_interval.tick().await;
+
+                let mut events = events.write().await;
+                let cutoff = SystemTime::now() - Duration::from_secs(retention_hours * 3600);
+                events.retain(|event| event.timestamp > cutoff);
+                
+                debug!("Event cleanup completed, {} events retained", events.len());
+            }
+        });
+    }
+}
+
+/// Mock agent implementation for demonstration
+struct MockAgent {
+    id: Uuid,
+    config: AgentDeploymentConfig,
+}
+
+impl MockAgent {
+    fn new(id: Uuid, config: AgentDeploymentConfig) -> Self {
+        Self { id, config }
+    }
+}
+
+#[async_trait::async_trait]
+impl Agent for MockAgent {
+    async fn handle(&self, input: serde_json::Value, _memory: Arc<crate::memory::Memory>) -> Result<String> {
+        // Mock agent response
+        Ok(format!("Mock agent {} processed: {:?}", self.id, input))
+    }
+
+    fn name(&self) -> &str {
+        &self.config.name
+    }
+
+    fn description(&self) -> &str {
+        "Mock agent for lifecycle testing"
+    }
+}
+
+// This would need to be implemented properly to support cloning
+impl Clone for LifecycleManager {
+    fn clone(&self) -> Self {
+        Self {
+            deployments: self.deployments.clone(),
+            instances: self.instances.clone(),
+            agents: self.agents.clone(),
+            events: self.events.clone(),
+            health_checks: self.health_checks.clone(),
+            scaling_decisions: self.scaling_decisions.clone(),
+            resource_monitor: self.resource_monitor.clone(),
+            deployment_semaphore: self.deployment_semaphore.clone(),
+            config: self.config.clone(),
+        }
+    }
+}
+
+/// Resource monitoring system
+pub struct ResourceMonitor {
+    // In a real implementation, this would interface with system monitoring tools
+}
+
+impl ResourceMonitor {
+    pub fn new() -> Self {
+        Self {}
+    }
+
+    pub async fn get_instance_usage(&self, _instance_id: Uuid) -> Result<ResourceUsage> {
+        // Mock resource usage data
+        Ok(ResourceUsage {
+            cpu_percent: 25.0,
+            memory_mb: 512,
+            disk_mb: 1024,
+            network_in_mbps: 1.5,
+            network_out_mbps: 0.8,
+        })
+    }
+}
+
+/// Deployment status information
+#[derive(Debug, Serialize)]
+pub struct DeploymentStatus {
+    pub name: String,
+    pub desired_replicas: u32,
+    pub current_replicas: u32,
+    pub healthy_replicas: u32,
+    pub running_replicas: u32,
+    pub instances: Vec<AgentInstance>,
+}

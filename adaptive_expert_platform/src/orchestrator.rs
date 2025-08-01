@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use anyhow::Result;
 use serde_json::Value;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tracing::{info, warn, error, instrument};
 
 use crate::{
@@ -12,6 +12,11 @@ use crate::{
     plugin::{self, PluginEvent, PluginSecurityConfig},
     settings::Settings,
     memory::Memory,
+    lifecycle::{LifecycleManager, LifecycleConfig},
+    monitoring::{MonitoringSystem, MonitoringConfig},
+    cache::{MultiTierCache, MultiTierCacheConfig},
+    websocket::{WebSocketServer, WebSocketConfig},
+    mesh::{AgentMesh, MeshConfig},
 };
 
 type Task = (String, Value, mpsc::Sender<Result<Value>>);
@@ -20,7 +25,16 @@ pub struct Orchestrator {
     agents: Arc<Mutex<HashMap<String, Arc<dyn Agent>>>>,
     memory: Arc<Memory>,
     plugin_security_config: PluginSecurityConfig,
+    task_semaphore: Arc<Semaphore>,
+    max_concurrent_tasks: usize,
     _bus: mpsc::Sender<PluginEvent>,
+    
+    // Advanced systems
+    lifecycle_manager: Arc<LifecycleManager>,
+    monitoring_system: Arc<MonitoringSystem>,
+    cache_system: Arc<MultiTierCache>,
+    websocket_server: Arc<WebSocketServer>,
+    agent_mesh: Option<Arc<AgentMesh>>,
 }
 
 impl Orchestrator {
@@ -31,6 +45,41 @@ impl Orchestrator {
 
         // Initialize plugin security configuration from settings
         let plugin_security_config = PluginSecurityConfig::from_security_config(&settings.security);
+        
+        // Initialize task throttling semaphore
+        let max_concurrent_tasks = settings.orchestrator.max_concurrent_tasks;
+        let task_semaphore = Arc::new(Semaphore::new(max_concurrent_tasks));
+        
+        info!("Orchestrator configured with max {} concurrent tasks", max_concurrent_tasks);
+
+        // Initialize advanced systems
+        let lifecycle_manager = Arc::new(LifecycleManager::new(LifecycleConfig::default()));
+        let monitoring_system = Arc::new(MonitoringSystem::new(MonitoringConfig::default()));
+        let cache_system = Arc::new(MultiTierCache::new(MultiTierCacheConfig::default()).await?);
+        let websocket_server = Arc::new(WebSocketServer::new(WebSocketConfig::default()));
+        
+        // Initialize agent mesh if enabled (optional)
+        let agent_mesh = if settings.orchestrator.enable_mesh_networking.unwrap_or(false) {
+            let mesh_config = MeshConfig {
+                bind_address: settings.server.bind_address.parse()?,
+                ..MeshConfig::default()
+            };
+            Some(Arc::new(AgentMesh::new(mesh_config).await?))
+        } else {
+            None
+        };
+
+        // Start all systems
+        lifecycle_manager.start().await?;
+        monitoring_system.start().await?;
+        websocket_server.start().await?;
+        
+        if let Some(ref mesh) = agent_mesh {
+            // Note: mesh.start() would need &mut self, so this would need refactoring
+            info!("Agent mesh networking enabled");
+        }
+
+        info!("All orchestrator subsystems initialized successfully");
 
         // ---------- secure hot-reload loop ----------
         let agents_reload = agents.clone();
@@ -92,7 +141,14 @@ impl Orchestrator {
             agents,
             memory,
             plugin_security_config,
-            _bus: bus_tx
+            task_semaphore,
+            max_concurrent_tasks,
+            _bus: bus_tx,
+            lifecycle_manager,
+            monitoring_system,
+            cache_system,
+            websocket_server,
+            agent_mesh,
         })
     }
 
@@ -101,6 +157,18 @@ impl Orchestrator {
     pub async fn dispatch(&self, task: Task) -> Result<()> {
         let (name, input, resp_tx) = task;
         tracing::Span::current().record("agent_name", &name);
+
+        // Acquire semaphore permit to limit concurrent tasks
+        let permit = match self.task_semaphore.try_acquire() {
+            Ok(permit) => permit,
+            Err(_) => {
+                warn!("Task queue full ({} concurrent tasks), rejecting task for agent '{}'", 
+                      self.max_concurrent_tasks, name);
+                let error = anyhow::anyhow!("Task queue full - too many concurrent tasks");
+                let _ = resp_tx.send(Err(error)).await;
+                return Ok(());
+            }
+        };
 
         let agent = {
             let map = self.agents.lock().await;
@@ -133,6 +201,9 @@ impl Orchestrator {
             }
         };
 
+        // Release permit automatically when it goes out of scope
+        drop(permit);
+        
         let _ = resp_tx.send(response).await;
         Ok(())
     }

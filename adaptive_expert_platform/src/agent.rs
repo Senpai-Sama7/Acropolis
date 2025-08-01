@@ -149,6 +149,39 @@ impl PythonToolAgent {
 
         Ok(())
     }
+
+    /// Validate command arguments to prevent shell injection and dangerous patterns
+    fn validate_command_args(args: &[String]) -> Result<()> {
+        for arg in args {
+            // Check for shell metacharacters that could be dangerous
+            let dangerous_chars = ['&', '|', ';', '`', '$', '>', '<', '(', ')', '{', '}'];
+            if arg.chars().any(|c| dangerous_chars.contains(&c)) {
+                return Err(anyhow!(
+                    "Command argument '{}' contains potentially dangerous shell metacharacters", 
+                    arg
+                ));
+            }
+            
+            // Check for common injection patterns
+            let dangerous_patterns = ["rm -", "shutdown", "reboot", "../", "sudo", "su ", "chmod"];
+            for pattern in &dangerous_patterns {
+                if arg.to_lowercase().contains(pattern) {
+                    return Err(anyhow!(
+                        "Command argument '{}' contains potentially dangerous pattern: {}", 
+                        arg, pattern
+                    ));
+                }
+            }
+            
+            // Limit argument length to prevent buffer overflow attacks
+            if arg.len() > 1000 {
+                return Err(anyhow!(
+                    "Command argument exceeds maximum length of 1000 characters"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -180,7 +213,9 @@ impl Agent for PythonToolAgent {
             parsed_input.args
         );
 
-        // Build command with security constraints
+        // Build command with security constraints and input validation
+        Self::validate_command_args(&parsed_input.args)?;
+        
         let mut cmd = Command::new("python3");
         cmd.arg(&parsed_input.script_path);
         cmd.args(&parsed_input.args);
@@ -194,20 +229,39 @@ impl Agent for PythonToolAgent {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
-        // Execute with timeout
+        // Execute with proper timeout and cleanup
         let timeout = parsed_input.timeout_seconds
             .map(std::time::Duration::from_secs)
             .unwrap_or(self.max_execution_time);
 
-        let output = tokio::time::timeout(timeout, cmd.output()).await
-            .map_err(|_| {
-                self.error_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                anyhow!("Python script execution timed out after {:?}", timeout)
-            })?
+        // Spawn child process for proper management
+        let mut child = cmd.spawn()
             .map_err(|e| {
                 self.error_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                anyhow!("Failed to execute Python script: {}", e)
+                anyhow!("Failed to spawn Python process: {}", e)
             })?;
+
+        // Wait for completion with timeout and proper cleanup
+        let output = match tokio::time::timeout(timeout, async {
+            // Handle timeout case by checking if child is still running
+            let output_result = child.wait_with_output().await;
+            match output_result {
+                Ok(output) => Ok(output),
+                Err(e) => Err(anyhow!("Failed to execute Python script: {}", e))
+            }
+        }).await {
+            Ok(result) => result?,
+            Err(_) => {
+                // Timeout occurred - forcefully terminate the process  
+                warn!("Python script execution timed out, killing process");
+                if let Err(e) = child.start_kill() {
+                    error!("Failed to kill timed-out Python process: {}", e);
+                }
+                
+                self.error_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Err(anyhow!("Python script execution timed out after {:?}", timeout));
+            }
+        };
 
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);

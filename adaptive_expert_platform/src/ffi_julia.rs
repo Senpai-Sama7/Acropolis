@@ -17,9 +17,10 @@ mod julia_impl {
         pub response: oneshot::Sender<Result<String>>,
     }
 
-    /// Initialize Julia runtime in a dedicated thread to avoid blocking Tokio
+    /// Initialize Julia runtime in a dedicated thread with bounded queue for concurrency control
     fn init_julia() -> Result<Sender<JuliaTask>> {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<JuliaTask>(10);
+        // Use a bounded channel with backpressure to limit concurrent Julia tasks
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<JuliaTask>(100);
 
         std::thread::spawn(move || {
             let mut julia = RuntimeBuilder::new().start().expect("Could not init Julia");
@@ -65,6 +66,18 @@ mod julia_impl {
         Ok(tx)
     }
 
+    /// Allowed Julia function names for security
+    const ALLOWED_JULIA_FUNCTIONS: &[&str] = &[
+        "main",
+        "run_model", 
+        "predict",
+        "train_model",
+        "causal_analysis",
+        "ltn_inference",
+        "clip_encode",
+        "process_data",
+    ];
+
     /// Julia agent that processes tasks via the runtime
     pub struct JuliaAgent {
         sender: Sender<JuliaTask>,
@@ -89,6 +102,15 @@ mod julia_impl {
                 .unwrap_or("main")
                 .to_string();
 
+            // Validate function name against allowlist
+            if !ALLOWED_JULIA_FUNCTIONS.contains(&function_name.as_str()) {
+                return Err(anyhow!(
+                    "Julia function '{}' not allowed. Permitted functions: {:?}", 
+                    function_name, 
+                    ALLOWED_JULIA_FUNCTIONS
+                ));
+            }
+
             let config = input.get("config")
                 .cloned()
                 .unwrap_or(input);
@@ -100,8 +122,15 @@ mod julia_impl {
                 response: response_tx,
             };
 
-            self.sender.send(task).await
-                .map_err(|_| anyhow!("Julia runtime channel closed"))?;
+            // Send with timeout to handle backpressure gracefully
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.sender.send(task)
+            ).await {
+                Ok(Ok(())) => {},
+                Ok(Err(_)) => return Err(anyhow!("Julia runtime channel closed")),
+                Err(_) => return Err(anyhow!("Julia task queue full - request timed out")),
+            }
 
             response_rx.await
                 .map_err(|_| anyhow!("Julia task response channel closed"))?

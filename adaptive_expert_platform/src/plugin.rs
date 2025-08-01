@@ -112,6 +112,10 @@ impl Plugin {
 
             if !security_config.allowed_hashes.contains(&hash) {
                 error!("Plugin hash not in allowlist: {} ({})", hash, lib_path.display());
+                
+                // Quarantine unsigned plugin
+                Self::quarantine_plugin(lib_path)?;
+                
                 return Err(anyhow!("Plugin not in security allowlist: {:?}", lib_path));
             }
 
@@ -177,6 +181,38 @@ impl Plugin {
             hash: self.hash.clone(),
             path: self.path.clone(),
         }
+    }
+
+    /// Quarantine an unsigned or malicious plugin by moving it to a secure location
+    fn quarantine_plugin(lib_path: &Path) -> Result<()> {
+        let quarantine_dir = lib_path.parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("quarantine");
+
+        // Create quarantine directory if it doesn't exist
+        if !quarantine_dir.exists() {
+            fs::create_dir_all(&quarantine_dir)
+                .with_context(|| format!("Failed to create quarantine directory: {:?}", quarantine_dir))?;
+        }
+
+        // Generate quarantine filename with timestamp
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let filename = lib_path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown_plugin");
+
+        let quarantine_path = quarantine_dir.join(format!("{}_{}", timestamp, filename));
+
+        // Move the plugin to quarantine
+        fs::rename(lib_path, &quarantine_path)
+            .with_context(|| format!("Failed to quarantine plugin: {:?} -> {:?}", lib_path, quarantine_path))?;
+
+        warn!("Plugin quarantined due to signature verification failure: {:?}", quarantine_path);
+        Ok(())
     }
 }
 

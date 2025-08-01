@@ -5,15 +5,20 @@
 pub mod agent;
 pub mod auth;
 pub mod batch;
+pub mod cache;
 pub mod cli;
+pub mod lifecycle;
 pub mod memory;
+pub mod mesh;
 pub mod metrics;
 pub mod middleware;
+pub mod monitoring;
 pub mod orchestrator;
 pub mod plugin;
 pub mod server;
 pub mod settings;
 pub mod telemetry;
+pub mod websocket;
 
 #[cfg(feature = "with-wasm")]
 pub mod wasm_plugin;

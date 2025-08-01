@@ -2,9 +2,11 @@
 
 use adaptive_expert_platform::{
     batch, cli, server, settings::Settings, telemetry,
+    auth::AuthManager,
 };
 use anyhow::Result;
 use clap::Parser;
+use rpassword::read_password;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -20,10 +22,83 @@ async fn main() -> Result<()> {
     // Execute the requested command
     match args.command {
         cli::Commands::Serve { addr: _ } => {
-            server::serve().await
+            server::serve(&settings).await
         }
         cli::Commands::Run { config } => {
             batch::run(config, settings).await
         }
+        cli::Commands::InitAdmin { username, password } => {
+            init_admin(username, password, &settings).await
+        }
     }
+}
+
+/// Initialize the first admin user
+async fn init_admin(username: String, password: Option<String>, settings: &Settings) -> Result<()> {
+    // Validate JWT secret before proceeding
+    validate_jwt_secret(settings)?;
+    
+    let jwt_secret = get_jwt_secret(settings)?;
+    let auth_manager = AuthManager::new(jwt_secret);
+    
+    // Check if admin already exists
+    if auth_manager.has_admin().await {
+        return Err(anyhow::anyhow!("Admin user already exists. Cannot reinitialize."));
+    }
+    
+    let password = match password {
+        Some(p) => p,
+        None => {
+            print!("Enter admin password: ");
+            std::io::Write::flush(&mut std::io::stdout())?;
+            read_password()?
+        }
+    };
+    
+    // Validate password strength
+    if password.len() < 12 {
+        return Err(anyhow::anyhow!("Password must be at least 12 characters long"));
+    }
+    
+    auth_manager.initialize_admin(username.clone(), &password).await?;
+    println!("Admin user '{}' initialized successfully", username);
+    Ok(())
+}
+
+/// Validate JWT secret meets security requirements
+fn validate_jwt_secret(settings: &Settings) -> Result<()> {
+    let jwt_secret = get_jwt_secret(settings)?;
+    
+    // Check minimum length
+    if jwt_secret.len() < 32 {
+        return Err(anyhow::anyhow!("JWT secret must be at least 32 characters long"));
+    }
+    
+    // Check for default/weak secrets
+    let weak_secrets = [
+        "default_insecure_secret_change_in_production",
+        "secret",
+        "jwt_secret",
+        "change_me",
+        "insecure",
+    ];
+    
+    if weak_secrets.contains(&jwt_secret.as_str()) {
+        return Err(anyhow::anyhow!("JWT secret is using a known weak value. Please use a strong, random secret."));
+    }
+    
+    // Basic entropy check - ensure it's not all the same character
+    let unique_chars: std::collections::HashSet<char> = jwt_secret.chars().collect();
+    if unique_chars.len() < 4 {
+        return Err(anyhow::anyhow!("JWT secret lacks sufficient entropy. Use a random, complex secret."));
+    }
+    
+    Ok(())
+}
+
+/// Get JWT secret from settings or environment
+fn get_jwt_secret(settings: &Settings) -> Result<String> {
+    settings.security.jwt_secret.clone()
+        .or_else(|| std::env::var("AEP_JWT_SECRET").ok())
+        .ok_or_else(|| anyhow::anyhow!("JWT secret must be provided via AEP_JWT_SECRET environment variable or config file"))
 }

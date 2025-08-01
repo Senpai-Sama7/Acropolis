@@ -28,4 +28,13 @@ pub enum Commands {
         #[arg(short, long)]
         config: PathBuf,
     },
+    /// Initialize the first admin user (run once at setup)
+    InitAdmin {
+        /// Admin username
+        #[arg(long)]
+        username: String,
+        /// Admin password (will prompt if not provided)
+        #[arg(long)]
+        password: Option<String>,
+    },
 }

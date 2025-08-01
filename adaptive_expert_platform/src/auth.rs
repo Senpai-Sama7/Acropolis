@@ -45,23 +45,40 @@ pub struct AuthManager {
 
 impl AuthManager {
     pub fn new(jwt_secret: String) -> Self {
-        let mut users = HashMap::new();
-
-        // Create default admin user (password: "admin123")
-        let admin_hash = Self::hash_password("admin123").unwrap();
-        users.insert("admin".to_string(), User {
-            id: "admin".to_string(),
-            username: "admin".to_string(),
-            password_hash: admin_hash,
-            roles: vec!["admin".to_string(), "user".to_string()],
-            active: true,
-        });
+        let users = HashMap::new();
 
         Self {
             users: Arc::new(RwLock::new(users)),
             jwt_secret,
             jwt_expiry_hours: 24, // 24 hour expiry
         }
+    }
+
+    /// Initialize the first admin user during setup
+    pub async fn initialize_admin(&self, username: String, password: &str) -> Result<()> {
+        let users = self.users.read().await;
+        if !users.is_empty() {
+            return Err(anyhow!("Admin user already exists. Cannot reinitialize."));
+        }
+        drop(users);
+
+        let password_hash = Self::hash_password(password)?;
+        let mut users = self.users.write().await;
+        users.insert(username.clone(), User {
+            id: username.clone(),
+            username,
+            password_hash,
+            roles: vec!["admin".to_string(), "user".to_string()],
+            active: true,
+        });
+
+        Ok(())
+    }
+
+    /// Check if admin user exists
+    pub async fn has_admin(&self) -> bool {
+        let users = self.users.read().await;
+        users.values().any(|user| user.roles.contains(&"admin".to_string()))
     }
 
     /// Hash a password securely using Argon2
