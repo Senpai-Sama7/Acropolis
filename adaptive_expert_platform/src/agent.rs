@@ -1,7 +1,9 @@
-use crate::memory::Memory;
+use crate::{memory::Memory, settings::Settings};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
@@ -100,6 +102,7 @@ pub struct PythonToolAgent {
     error_count: std::sync::atomic::AtomicU64,
     start_time: std::time::Instant,
     allowed_directories: Vec<String>,
+    script_allowlist_hashes: HashMap<String, String>,
     max_execution_time: std::time::Duration,
 }
 
@@ -108,20 +111,17 @@ struct PythonToolInput {
     script_path: String,
     args: Vec<String>,
     timeout_seconds: Option<u64>,
-    working_directory: Option<String>,
 }
 
 impl PythonToolAgent {
-    pub fn new() -> Self {
+    pub fn new(settings: &Settings) -> Self {
         Self {
             request_count: std::sync::atomic::AtomicU64::new(0),
             error_count: std::sync::atomic::AtomicU64::new(0),
             start_time: std::time::Instant::now(),
-            allowed_directories: vec![
-                "/tmp".to_string(),
-                "/var/tmp".to_string(),
-                std::env::current_dir().unwrap_or_default().to_string_lossy().to_string(),
-            ],
+            // Scripts must be in a dedicated, non-tmp directory
+            allowed_directories: vec!["./python_scripts".to_string()],
+            script_allowlist_hashes: settings.security.script_allowlist_hashes.clone(),
             max_execution_time: std::time::Duration::from_secs(300), // 5 minutes
         }
     }
@@ -182,6 +182,33 @@ impl PythonToolAgent {
         }
         Ok(())
     }
+
+    /// Validate the integrity of the script file by checking its hash
+    fn validate_script_integrity(&self, path: &str) -> Result<()> {
+        if self.script_allowlist_hashes.is_empty() {
+            warn!("Script allowlist is empty. Skipping integrity check for {}", path);
+            return Ok(());
+        }
+
+        let expected_hash = self.script_allowlist_hashes.get(path)
+            .ok_or_else(|| anyhow!("Script '{}' is not in the allowlist", path))?;
+
+        let file_content = std::fs::read(path)?;
+        let mut hasher = Sha256::new();
+        hasher.update(&file_content);
+        let actual_hash = format!("{:x}", hasher.finalize());
+
+        if actual_hash != *expected_hash {
+            return Err(anyhow!(
+                "Script integrity check failed for '{}'. Expected hash: {}, Actual hash: {}",
+                path,
+                expected_hash,
+                actual_hash
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -204,8 +231,9 @@ impl Agent for PythonToolAgent {
                 anyhow!("Invalid Python tool input: {}", e)
             })?;
 
-        // Validate script path
+        // Validate script path and integrity
         self.validate_script_path(&parsed_input.script_path)?;
+        self.validate_script_integrity(&parsed_input.script_path)?;
 
         info!(
             "Executing Python script: {} with args: {:?}",
@@ -220,9 +248,9 @@ impl Agent for PythonToolAgent {
         cmd.arg(&parsed_input.script_path);
         cmd.args(&parsed_input.args);
 
-        // Set working directory if specified
-        if let Some(work_dir) = parsed_input.working_directory {
-            cmd.current_dir(work_dir);
+        // The working directory is now fixed to where the script is located
+        if let Some(script_dir) = std::path::Path::new(&parsed_input.script_path).parent() {
+            cmd.current_dir(script_dir);
         }
 
         // Set up I/O
@@ -410,10 +438,15 @@ impl Agent for LlmAgent {
 pub struct AgentFactory;
 
 impl AgentFactory {
-    pub fn create_agent(agent_type: &str, config: serde_json::Value) -> Result<Box<dyn Agent>> {
+    pub fn create_agent(agent_type: &str, config: serde_json::Value, settings: &Settings) -> Result<Box<dyn Agent>> {
         match agent_type {
             "echo" => Ok(Box::new(EchoAgent::new())),
-            "python" => Ok(Box::new(PythonToolAgent::new())),
+            "python" => Ok(Box::new(PythonToolAgent::new(settings))),
+            #[cfg(feature = "with-julia")]
+            "julia" => {
+                use crate::ffi_julia::JuliaAgent;
+                Ok(Box::new(JuliaAgent::new(settings)?))
+            }
             #[cfg(feature = "with-llama")]
             "llm" => {
                 let name = config.get("name")

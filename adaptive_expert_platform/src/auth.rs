@@ -11,9 +11,7 @@ use axum::{
 };
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 /// JWT claims structure
@@ -26,7 +24,7 @@ pub struct Claims {
 }
 
 /// User authentication information
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
     pub id: String,
     pub username: String,
@@ -35,50 +33,59 @@ pub struct User {
     pub active: bool,
 }
 
-/// Authentication manager
+/// Authentication manager using a persistent sled database
 #[derive(Clone)]
 pub struct AuthManager {
-    users: Arc<RwLock<HashMap<String, User>>>,
+    db: Arc<sled::Db>,
     jwt_secret: String,
     jwt_expiry_hours: usize,
 }
 
 impl AuthManager {
-    pub fn new(jwt_secret: String) -> Self {
-        let users = HashMap::new();
-
-        Self {
-            users: Arc::new(RwLock::new(users)),
+    /// Creates a new AuthManager, opening or creating a sled database at the given path.
+    pub fn new(jwt_secret: String, db_path: &str) -> Result<Self> {
+        let db = sled::open(db_path)
+            .map_err(|e| anyhow!("Failed to open auth database at '{}': {}", db_path, e))?;
+        info!("Authentication database opened at '{}'", db_path);
+        Ok(Self {
+            db: Arc::new(db),
             jwt_secret,
             jwt_expiry_hours: 24, // 24 hour expiry
-        }
+        })
     }
 
     /// Initialize the first admin user during setup
-    pub async fn initialize_admin(&self, username: String, password: &str) -> Result<()> {
-        let users = self.users.read().await;
-        if !users.is_empty() {
+    pub fn initialize_admin(&self, username: String, password: &str) -> Result<()> {
+        if self.has_admin()? {
             return Err(anyhow!("Admin user already exists. Cannot reinitialize."));
         }
-        drop(users);
 
         let password_hash = Self::hash_password(password)?;
-        let mut users = self.users.write().await;
-        users.insert(username.clone(), User {
+        let user = User {
             id: username.clone(),
-            username,
+            username: username.clone(),
             password_hash,
             roles: vec!["admin".to_string(), "user".to_string()],
             active: true,
-        });
+        };
+
+        let user_bytes = bincode::serialize(&user)?;
+        self.db.insert(username.as_bytes(), user_bytes)?;
+        self.db.flush()?; // Ensure data is written to disk
 
         Ok(())
     }
 
-    /// Check if admin user exists
-    pub async fn has_admin(&self) -> bool {
-        let users = self.users.read().await;
-        users.values().any(|user| user.roles.contains(&"admin".to_string()))
+    /// Check if an admin user exists in the database
+    pub fn has_admin(&self) -> Result<bool> {
+        for item in self.db.iter() {
+            let (_, user_bytes) = item?;
+            let user: User = bincode::deserialize(&user_bytes)?;
+            if user.roles.contains(&"admin".to_string()) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Hash a password securely using Argon2
@@ -102,11 +109,11 @@ impl AuthManager {
     }
 
     /// Authenticate user and return JWT token
-    pub async fn authenticate(&self, username: &str, password: &str) -> Result<String> {
-        let users = self.users.read().await;
-
-        let user = users.get(username)
+    pub fn authenticate(&self, username: &str, password: &str) -> Result<String> {
+        let user_bytes = self.db.get(username.as_bytes())?
             .ok_or_else(|| anyhow!("User not found"))?;
+
+        let user: User = bincode::deserialize(&user_bytes)?;
 
         if !user.active {
             return Err(anyhow!("User account is disabled"));
@@ -118,11 +125,11 @@ impl AuthManager {
         }
 
         info!("Successful authentication for user: {}", username);
-        self.generate_token(user).await
+        self.generate_token(&user)
     }
 
     /// Generate JWT token for user
-    async fn generate_token(&self, user: &User) -> Result<String> {
+    fn generate_token(&self, user: &User) -> Result<String> {
         let now = chrono::Utc::now();
         let exp = now + chrono::Duration::hours(self.jwt_expiry_hours as i64);
 
@@ -157,10 +164,8 @@ impl AuthManager {
     }
 
     /// Add new user (admin only)
-    pub async fn add_user(&self, username: String, password: &str, roles: Vec<String>) -> Result<()> {
-        let mut users = self.users.write().await;
-
-        if users.contains_key(&username) {
+    pub fn add_user(&self, username: String, password: &str, roles: Vec<String>) -> Result<()> {
+        if self.db.contains_key(username.as_bytes())? {
             return Err(anyhow!("User already exists"));
         }
 
@@ -173,29 +178,36 @@ impl AuthManager {
             active: true,
         };
 
-        users.insert(username, user);
+        let user_bytes = bincode::serialize(&user)?;
+        self.db.insert(username.as_bytes(), user_bytes)?;
+        self.db.flush()?;
         Ok(())
     }
 
     /// Update user password
-    pub async fn update_password(&self, username: &str, new_password: &str) -> Result<()> {
-        let mut users = self.users.write().await;
-
-        let user = users.get_mut(username)
-            .ok_or_else(|| anyhow!("User not found"))?;
-
+    pub fn update_password(&self, username: &str, new_password: &str) -> Result<()> {
+        let mut user = self.get_user(username)?;
         user.password_hash = Self::hash_password(new_password)?;
-        Ok(())
+        self.update_user(&user)
     }
 
     /// Disable user account
-    pub async fn disable_user(&self, username: &str) -> Result<()> {
-        let mut users = self.users.write().await;
-
-        let user = users.get_mut(username)
-            .ok_or_else(|| anyhow!("User not found"))?;
-
+    pub fn disable_user(&self, username: &str) -> Result<()> {
+        let mut user = self.get_user(username)?;
         user.active = false;
+        self.update_user(&user)
+    }
+
+    fn get_user(&self, username: &str) -> Result<User> {
+        let user_bytes = self.db.get(username)?.ok_or_else(|| anyhow!("User not found"))?;
+        let user: User = bincode::deserialize(&user_bytes)?;
+        Ok(user)
+    }
+
+    fn update_user(&self, user: &User) -> Result<()> {
+        let user_bytes = bincode::serialize(user)?;
+        self.db.insert(user.username.as_bytes(), user_bytes)?;
+        self.db.flush()?;
         Ok(())
     }
 }
@@ -217,8 +229,7 @@ pub fn extract_token(headers: &HeaderMap) -> Result<String> {
 /// Authentication middleware
 pub async fn auth_middleware(
     State(auth_manager): State<Arc<AuthManager>>,
-    headers: HeaderMap,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
     // Skip authentication for health endpoint
@@ -226,7 +237,7 @@ pub async fn auth_middleware(
         return Ok(next.run(request).await);
     }
 
-    let token = match extract_token(&headers) {
+    let token = match extract_token(request.headers()) {
         Ok(token) => token,
         Err(_) => {
             warn!("Unauthorized request to {}", request.uri().path());
@@ -237,7 +248,6 @@ pub async fn auth_middleware(
     match auth_manager.validate_token(&token) {
         Ok(claims) => {
             // Add claims to request extensions for downstream use
-            let mut request = request;
             request.extensions_mut().insert(claims);
             Ok(next.run(request).await)
         }
@@ -284,26 +294,52 @@ pub struct LoginResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
-    #[tokio::test]
-    async fn test_password_hashing() {
-        let password = "test123";
-        let hash = AuthManager::hash_password(password).unwrap();
-        assert!(AuthManager::verify_password(password, &hash).unwrap());
-        assert!(!AuthManager::verify_password("wrong", &hash).unwrap());
+    fn create_test_auth_manager() -> AuthManager {
+        let dir = tempdir().unwrap();
+        AuthManager::new("test_secret".to_string(), dir.path().to_str().unwrap()).unwrap()
     }
 
-    #[tokio::test]
-    async fn test_authentication() {
-        let auth_manager = AuthManager::new("test_secret".to_string());
+    #[test]
+    fn test_password_hashing() {
+        let password = "test_password_123!";
+        let hash = AuthManager::hash_password(password).unwrap();
+        assert!(AuthManager::verify_password(password, &hash).unwrap());
+        assert!(!AuthManager::verify_password("wrong_password", &hash).unwrap());
+    }
 
-        // Test successful authentication
-        let token = auth_manager.authenticate("admin", "admin123").await.unwrap();
+    #[test]
+    fn test_user_management() {
+        let auth_manager = create_test_auth_manager();
+        let username = "test_user".to_string();
+        let password = "test_password_123!";
+        let roles = vec!["user".to_string()];
+
+        // Add user
+        auth_manager.add_user(username.clone(), password, roles.clone()).unwrap();
+
+        // Authenticate user
+        let token = auth_manager.authenticate(&username, password).unwrap();
         let claims = auth_manager.validate_token(&token).unwrap();
-        assert_eq!(claims.sub, "admin");
-        assert!(claims.roles.contains(&"admin".to_string()));
+        assert_eq!(claims.sub, username);
+        assert_eq!(claims.roles, roles);
 
-        // Test failed authentication
-        assert!(auth_manager.authenticate("admin", "wrong").await.is_err());
+        // Disable user
+        auth_manager.disable_user(&username).unwrap();
+        let err = auth_manager.authenticate(&username, password).unwrap_err();
+        assert_eq!(err.to_string(), "User account is disabled");
+    }
+
+    #[test]
+    fn test_admin_initialization() {
+        let auth_manager = create_test_auth_manager();
+        assert!(!auth_manager.has_admin().unwrap());
+
+        auth_manager.initialize_admin("admin".to_string(), "admin_password").unwrap();
+        assert!(auth_manager.has_admin().unwrap());
+
+        // Should fail to initialize again
+        assert!(auth_manager.initialize_admin("admin2".to_string(), "admin_password2").is_err());
     }
 }

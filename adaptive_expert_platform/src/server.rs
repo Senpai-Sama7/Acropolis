@@ -99,18 +99,23 @@ pub fn create_router(state: AppState) -> Router {
         .route("/health", get(health_check))
         .route("/auth/login", post(login));
 
-    // Protected routes (authentication required)
-    let protected_routes = Router::new()
-        .route("/agents", get(list_agents))
+    // Admin-only routes
+    let admin_routes = Router::new()
         .route("/agents", post(register_agent))
         .route("/agents/:name", delete(remove_agent))
+        .route("/auth/users", post(create_user))
+        .route_layer(middleware::from_fn(crate::auth::require_role("admin")));
+
+    // General protected routes
+    let protected_routes = Router::new()
+        .route("/agents", get(list_agents))
         .route("/execute", post(execute_task))
         .route("/memory/stats", get(memory_stats))
         .route("/memory/search", post(search_memory))
         .route("/memory/add", post(add_memory))
         .route("/metrics", get(get_metrics))
-        .route("/auth/users", post(create_user)) // Admin only
         .route("/auth/password", post(change_password))
+        .merge(admin_routes) // Merge admin routes under the main auth middleware
         .layer(middleware::from_fn_with_state(
             state.auth_manager.clone(),
             auth_middleware
@@ -173,29 +178,25 @@ async fn list_agents(
     Ok(Json(agent_infos))
 }
 
+use crate::agent::AgentFactory;
+
 /// Register a new agent
 #[instrument(skip(state))]
 async fn register_agent(
     State(state): State<AppState>,
     Json(request): Json<RegisterAgentRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    let mut orchestrator = state.orchestrator.write().await;
+    let agent = AgentFactory::create_agent(&request.agent_type, request.config, &state.settings)
+        .map_err(|e| {
+            warn!("Failed to create agent '{}': {}", request.name, e);
+            StatusCode::BAD_REQUEST
+        })?;
 
-    // TODO: Implement agent registration based on type
-    match request.agent_type.as_str() {
-        "echo" => {
-            use crate::agent::EchoAgent;
-            orchestrator.register_agent(Arc::new(EchoAgent));
-        }
-        "python" => {
-            use crate::agent::PythonToolAgent;
-            orchestrator.register_agent(Arc::new(PythonToolAgent::new()));
-        }
-        _ => {
-            warn!("Unknown agent type: {}", request.agent_type);
-            return Err(StatusCode::BAD_REQUEST);
-        }
-    }
+    let mut orchestrator = state.orchestrator.write().await;
+    orchestrator.register_agent(request.name.clone(), agent).await.map_err(|e| {
+        error!("Failed to register agent '{}': {}", request.name, e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     info!("Registered agent: {}", request.name);
     Ok(StatusCode::CREATED)
@@ -330,7 +331,16 @@ async fn login(
     State(state): State<AppState>,
     Json(request): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, StatusCode> {
-    match state.auth_manager.authenticate(&request.username, &request.password).await {
+    let auth_manager = state.auth_manager.clone();
+    let username = request.username.clone();
+    let password = request.password.clone();
+
+    // Use spawn_blocking for synchronous database operations
+    let result = tokio::task::spawn_blocking(move || {
+        auth_manager.authenticate(&username, &password)
+    }).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    match result {
         Ok(token) => {
             let claims = state.auth_manager.validate_token(&token)
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -358,20 +368,19 @@ async fn create_user(
     State(state): State<AppState>,
     Json(request): Json<CreateUserRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    // This endpoint should only be accessible by admins
-    // Role-based authorization would be handled by middleware
+    let auth_manager = state.auth_manager.clone();
 
-    match state.auth_manager.add_user(
-        request.username,
-        &request.password,
-        request.roles
-    ).await {
+    let result = tokio::task::spawn_blocking(move || {
+        auth_manager.add_user(request.username, &request.password, request.roles)
+    }).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    match result {
         Ok(_) => {
-            info!("User {} created successfully", request.username);
+            info!("User created successfully");
             Ok(StatusCode::CREATED)
         }
         Err(e) => {
-            error!("Failed to create user {}: {}", request.username, e);
+            error!("Failed to create user: {}", e);
             Err(StatusCode::CONFLICT)
         }
     }
@@ -383,7 +392,13 @@ async fn change_password(
     State(state): State<AppState>,
     Json(request): Json<ChangePasswordRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    match state.auth_manager.update_password(&request.username, &request.new_password).await {
+    let auth_manager = state.auth_manager.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        auth_manager.update_password(&request.username, &request.new_password)
+    }).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    match result {
         Ok(_) => {
             info!("Password changed for user {}", request.username);
             Ok(StatusCode::OK)
@@ -438,11 +453,12 @@ pub async fn serve(settings: &Settings) -> Result<()> {
     ));
 
     // Initialize authentication manager with validated JWT secret
+    let db_path = settings.db_path.clone().unwrap_or_else(|| "./acropolis_db/auth".to_string());
     let jwt_secret = get_jwt_secret_for_server(settings)?;
-    let auth_manager = Arc::new(AuthManager::new(jwt_secret));
+    let auth_manager = Arc::new(AuthManager::new(jwt_secret, &db_path)?);
     
     // Check admin initialization
-    if settings.security.enable_authentication && !auth_manager.has_admin().await {
+    if settings.security.enable_authentication && !auth_manager.has_admin()? {
         error!("No admin user found. Run 'acropolis-cli init-admin' to create the first admin user.");
         return Err(anyhow::anyhow!("Admin user must be initialized before starting the server"));
     }

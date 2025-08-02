@@ -195,6 +195,7 @@ pub struct SecurityConfig {
     pub max_request_size_mb: usize,
     pub enable_plugin_signatures: bool,
     pub plugin_allowlist_hashes: Vec<String>,
+    pub script_allowlist_hashes: HashMap<String, String>,
     pub max_plugin_size_mb: usize,
     pub enable_resource_limits: bool,
     pub max_execution_time_seconds: u64,
@@ -219,6 +220,7 @@ impl Default for SecurityConfig {
             max_request_size_mb: 5, // Smaller default size
             enable_plugin_signatures: true, // Always require signatures
             plugin_allowlist_hashes: vec![], // Empty by default - must be configured
+            script_allowlist_hashes: HashMap::new(),
             max_plugin_size_mb: 10, // Smaller plugin size limit
             enable_resource_limits: true,
             max_execution_time_seconds: 30,
@@ -270,6 +272,7 @@ pub struct Settings {
     pub llm: LlmConfig,
     pub security: SecurityConfig,
     pub observability: ObservabilityConfig,
+    pub db_path: Option<String>,
 
     // Legacy fields for backward compatibility
     pub plugin_dir: PathBuf,
@@ -287,6 +290,7 @@ impl Default for Settings {
             llm: LlmConfig::default(),
             security: SecurityConfig::default(),
             observability: ObservabilityConfig::default(),
+            db_path: None,
 
             // Legacy fields
             plugin_dir: PathBuf::from("plugins"),
