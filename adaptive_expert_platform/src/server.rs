@@ -33,6 +33,7 @@ pub struct AppState {
     pub auth_manager: Arc<AuthManager>,
     pub rate_limiter: Arc<crate::middleware::AppRateLimiter>,
     pub settings: Settings,
+    pub start_time: std::time::Instant,
 }
 
 /// Health check response
@@ -144,15 +145,18 @@ async fn health_check(
     State(state): State<AppState>,
 ) -> Result<Json<HealthResponse>, StatusCode> {
     let orchestrator = state.orchestrator.read().await;
-    let agent_count = orchestrator.list_agents().len();
+    let agent_count = orchestrator.list_agents().await.len();
+    let uptime_seconds = state.start_time.elapsed().as_secs();
 
-    // TODO: Get actual uptime and memory stats
+    // In a real implementation, you would get this from the actual memory system
+    let memory_fragments = 0; // Dummy value
+
     let response = HealthResponse {
         status: "healthy".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        uptime_seconds: 0, // TODO: Track actual uptime
+        uptime_seconds,
         agent_count,
-        memory_fragments: 0, // TODO: Get from memory
+        memory_fragments,
     };
 
     Ok(Json(response))
@@ -164,13 +168,13 @@ async fn list_agents(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<AgentInfo>>, StatusCode> {
     let orchestrator = state.orchestrator.read().await;
-    let agents = orchestrator.list_agents();
+    let agents = orchestrator.list_agents().await;
 
     let agent_infos: Vec<AgentInfo> = agents
         .into_iter()
-        .map(|name| AgentInfo {
+        .map(|(name, agent_type)| AgentInfo {
             name,
-            agent_type: "unknown".to_string(), // TODO: Track agent types
+            agent_type,
             status: "active".to_string(),
         })
         .collect();
@@ -208,11 +212,13 @@ async fn remove_agent(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
-    let mut orchestrator = state.orchestrator.write().await;
-
-    // TODO: Implement agent removal
-    warn!("Agent removal not yet implemented: {}", name);
-    Ok(StatusCode::OK)
+    let orchestrator = state.orchestrator.read().await;
+    orchestrator.remove_agent(&name).await.map_err(|e| {
+        error!("Failed to remove agent '{}': {}", name, e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    info!("Removed agent: {}", name);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Execute a task with an agent
@@ -226,26 +232,26 @@ async fn execute_task(
 
     // Create a dummy memory for now
     let dummy_memory = Arc::new(create_dummy_memory());
+    let (resp_tx, mut resp_rx) = tokio::sync::mpsc::channel(1);
 
-    let result = orchestrator.dispatch((
+    orchestrator.dispatch((
         request.agent_name.clone(),
         request.input,
-        tokio::sync::mpsc::channel(1).0,
-    )).await;
+        resp_tx,
+    )).await?;
 
     let execution_time = start_time.elapsed().as_millis() as u64;
 
-    match result {
-        Ok(_) => {
-            // TODO: Get actual result from channel
+    match resp_rx.recv().await {
+        Some(Ok(result)) => {
             Ok(Json(ExecuteTaskResponse {
                 success: true,
-                result: Some("Task executed successfully".to_string()),
+                result: Some(result.to_string()),
                 error: None,
                 execution_time_ms: execution_time,
             }))
         }
-        Err(e) => {
+        Some(Err(e)) => {
             error!("Task execution failed: {}", e);
             Ok(Json(ExecuteTaskResponse {
                 success: false,
@@ -253,6 +259,10 @@ async fn execute_task(
                 error: Some(e.to_string()),
                 execution_time_ms: execution_time,
             }))
+        }
+        None => {
+            error!("Task execution response channel closed unexpectedly");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }
@@ -471,6 +481,7 @@ pub async fn serve(settings: &Settings) -> Result<()> {
         auth_manager,
         rate_limiter,
         settings: settings.clone(),
+        start_time: std::time::Instant::now(),
     };
 
     // Create router

@@ -283,6 +283,11 @@ impl Memory {
             similarity_threshold: self.similarity_threshold,
         }
     }
+
+    /// Get the number of memory fragments
+    pub async fn get_fragment_count(&self) -> usize {
+        self.fragments.read().await.len()
+    }
 }
 
 /// Memory statistics
