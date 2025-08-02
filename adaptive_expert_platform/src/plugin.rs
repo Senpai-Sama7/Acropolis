@@ -39,7 +39,7 @@ impl Default for PluginSecurityConfig {
         Self {
             allowed_hashes: HashSet::new(),
             require_signatures: true, // Always require signatures in production
-max_plugin_size: 10 * 1024 * 1024, // 10MB
+            max_plugin_size: 10_485_760, // 10MB
             allowed_extensions,
         }
     }

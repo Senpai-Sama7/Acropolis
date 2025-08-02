@@ -111,9 +111,12 @@ mod julia_impl {
             }
         });
 
-        init_rx.recv()??;
-
-        Ok(tx)
+        let init_timeout = std::time::Duration::from_secs(30);
+        match init_rx.recv_timeout(init_timeout) {
+            Ok(Ok(_)) => Ok(tx),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(anyhow!("Julia runtime initialization timed out after {:?}", init_timeout)),
+        }
     }
 
     /// Allowed Julia function names for security
