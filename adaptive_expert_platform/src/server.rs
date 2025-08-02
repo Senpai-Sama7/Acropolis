@@ -311,8 +311,8 @@ async fn add_memory(
         .ok_or(StatusCode::BAD_REQUEST)?;
 
     // TODO: Use actual memory instance
-    let dummy_memory = create_dummy_memory();
-    dummy_memory.add_memory(content).await
+    let memory = state.orchestrator.read().await.memory();
+    memory.add_memory(content).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(StatusCode::CREATED)
