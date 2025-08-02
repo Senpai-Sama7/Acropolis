@@ -153,6 +153,10 @@ mod julia_impl {
             "language_model"
         }
 
+        fn capabilities(&self) -> Vec<String> {
+            vec!["julia_execute".to_string()]
+        }
+
         async fn health_check(&self) -> Result<crate::agent::AgentHealth> {
             if self.sender.is_closed() {
                 let mut health = crate::agent::AgentHealth::default();

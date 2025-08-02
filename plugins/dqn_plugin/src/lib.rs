@@ -1,7 +1,7 @@
 // plugins/dqn_plugin/src/lib.rs
 //! Simple Q-Learning agent – sample native plugin (simplified version without torch).
 
-use adaptive_expert_platform::agent::Agent;
+use adaptive_expert_platform::agent::{Agent, AgentHealth};
 use adaptive_expert_platform::memory::Memory;
 use adaptive_expert_platform::plugin::PluginRegistrar;
 use anyhow::{anyhow, Result};
@@ -10,6 +10,8 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 use tracing::{info, warn, debug};
 
 /// Hyper-parameters for the Q-learning agent (JSON-loadable).
@@ -62,6 +64,9 @@ pub struct QLearningAgent {
     last_action: Mutex<Option<usize>>,
     steps: Mutex<u64>,
     total_reward: Mutex<f64>,
+    request_count: AtomicU64,
+    error_count: AtomicU64,
+    start_time: Instant,
 }
 
 impl QLearningAgent {
@@ -73,6 +78,9 @@ impl QLearningAgent {
             last_action: Mutex::new(None),
             steps: Mutex::new(0),
             total_reward: Mutex::new(0.0),
+            request_count: AtomicU64::new(0),
+            error_count: AtomicU64::new(0),
+            start_time: Instant::now(),
         }
     }
 
@@ -206,9 +214,18 @@ impl Agent for QLearningAgent {
         "qlearning"
     }
 
+    fn agent_type(&self) -> &str {
+        "reinforcement"
+    }
+
+    fn capabilities(&self) -> Vec<String> {
+        vec!["configure".to_string(), "step".to_string(), "stats".to_string()]
+    }
+
     async fn handle(&self, input: serde_json::Value, _memory: Arc<Memory>) -> Result<String> {
+        self.request_count.fetch_add(1, Ordering::Relaxed);
         // Parse input to determine action
-        match input.get("action").and_then(|v| v.as_str()) {
+        let result = match input.get("action").and_then(|v| v.as_str()) {
             Some("configure") => {
                 let config_str = input.get("config")
                     .and_then(|v| v.as_str())
@@ -247,7 +264,24 @@ impl Agent for QLearningAgent {
             _ => {
                 Err(anyhow!("Unknown action. Supported actions: configure, step, stats, reset"))
             }
+        };
+
+        if result.is_err() {
+            self.error_count.fetch_add(1, Ordering::Relaxed);
         }
+
+        result
+    }
+
+    async fn health_check(&self) -> Result<AgentHealth> {
+        Ok(AgentHealth {
+            status: "healthy".to_string(),
+            details: None,
+            uptime_seconds: self.start_time.elapsed().as_secs(),
+            total_requests: self.request_count.load(Ordering::Relaxed),
+            error_count: self.error_count.load(Ordering::Relaxed),
+            average_response_time_ms: 0.0,
+        })
     }
 }
 

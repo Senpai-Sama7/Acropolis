@@ -15,7 +15,7 @@ use tokio::sync::RwLock;
 use tracing::{info, warn, error, instrument};
 
 use crate::{
-    agent::Agent,
+    agent::{Agent, HashEmbeddingAgent, LengthRerankAgent},
     auth::{AuthManager, Claims, LoginRequest, LoginResponse, auth_middleware},
     middleware::{
         create_cors_layer, create_rate_limiter, create_body_limit_layer,
@@ -23,8 +23,12 @@ use crate::{
     },
     orchestrator::Orchestrator,
     settings::Settings,
-    memory::Memory,
+    memory::{Memory, EmbeddingCache, redis_store::{InMemoryEmbeddingCache}},
+    monitoring::MonitoringSystem,
 };
+
+#[cfg(feature = "with-redis")]
+use crate::memory::redis_store::RedisCache;
 
 /// Application state shared across HTTP handlers
 #[derive(Clone)]
@@ -34,6 +38,7 @@ pub struct AppState {
     pub rate_limiter: Arc<crate::middleware::AppRateLimiter>,
     pub settings: Settings,
     pub start_time: std::time::Instant,
+    pub monitoring: Arc<MonitoringSystem>,
 }
 
 /// Health check response
@@ -327,15 +332,12 @@ async fn add_memory(
 async fn get_metrics(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    // TODO: Implement actual metrics collection
+    let system = state.monitoring.get_system_metrics().await;
+    let agents = state.monitoring.get_all_agent_metrics().await;
     let metrics = serde_json::json!({
-        "requests_per_second": 0,
-        "average_response_time_ms": 0,
-        "error_rate": 0.0,
-        "memory_usage_mb": 0.0,
-        "cpu_usage_percent": 0.0,
+        "system": system,
+        "agents": agents,
     });
-
     Ok(Json(metrics))
 }
 
@@ -441,12 +443,12 @@ struct ChangePasswordRequest {
 
 /// Create a dummy memory instance for testing
 fn create_dummy_memory() -> Memory {
-    use crate::memory::redis_store::InMemoryEmbeddingCache;
-    use crate::agent::EchoAgent;
+    use crate::agent::{HashEmbeddingAgent, LengthRerankAgent};
 
     let cache = Arc::new(InMemoryEmbeddingCache::new());
-    let echo_agent = Arc::new(EchoAgent);
-    Memory::new(echo_agent.clone(), echo_agent, cache)
+    let embed = Arc::new(HashEmbeddingAgent::new(384));
+    let rerank = Arc::new(LengthRerankAgent::new());
+    Memory::new(embed, rerank, cache)
 }
 
 /// Start the HTTP server and wait for shutdown signal
@@ -456,10 +458,35 @@ pub async fn serve(settings: &Settings) -> Result<()> {
     // Enforce strict JWT secret validation
     validate_jwt_secret_startup(settings)?;
 
-    // Create application state
-    let memory_cache = Arc::new(crate::memory::redis_store::InMemoryEmbeddingCache::new());
-    let echo_agent = Arc::new(crate::agent::EchoAgent::new());
-    let memory = Arc::new(Memory::new(echo_agent.clone(), echo_agent, memory_cache));
+    // Configure memory cache
+    let memory_cache: Arc<dyn EmbeddingCache> = if settings.memory.provider == "redis" {
+        #[cfg(feature = "with-redis")]
+        {
+            let url = settings.memory.url.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Redis URL must be provided for redis memory provider"))?;
+            Arc::new(RedisCache::new(url).await.map_err(|e| {
+                error!("Failed to connect to Redis: {}", e);
+                e
+            })?)
+        }
+        #[cfg(not(feature = "with-redis"))]
+        {
+            return Err(anyhow::anyhow!("Redis memory provider requested but 'with-redis' feature not enabled"));
+        }
+    } else {
+        Arc::new(InMemoryEmbeddingCache::new())
+    };
+
+    // Initialize embedding and reranking agents
+    let embedding_agent = Arc::new(HashEmbeddingAgent::new(settings.memory.embedding_dim));
+    let reranker_agent = Arc::new(LengthRerankAgent::new());
+
+    let memory = Arc::new(
+        Memory::new(embedding_agent.clone(), reranker_agent.clone(), memory_cache)
+            .with_max_fragments(settings.memory.max_fragments)
+            .with_embedding_dim(settings.memory.embedding_dim)
+            .with_similarity_threshold(settings.memory.similarity_threshold),
+    );
 
     let orchestrator = Arc::new(RwLock::new(
         Orchestrator::new(&settings, memory.clone()).await
@@ -483,12 +510,15 @@ pub async fn serve(settings: &Settings) -> Result<()> {
     // Initialize rate limiter
     let rate_limiter = create_rate_limiter(&settings.security);
 
+    let monitoring = orchestrator.read().await.monitoring();
+
     let state = AppState {
         orchestrator,
         auth_manager,
         rate_limiter,
         settings: settings.clone(),
         start_time: std::time::Instant::now(),
+        monitoring,
     };
 
     // Create router
@@ -508,7 +538,8 @@ pub async fn serve(settings: &Settings) -> Result<()> {
     let server = axum::serve(listener, app);
 
     // Wait for shutdown signal
-    let graceful = server.with_graceful_shutdown(wait_for_shutdown());
+    let orchestrator_for_shutdown = state.orchestrator.clone();
+    let graceful = server.with_graceful_shutdown(wait_for_shutdown(orchestrator_for_shutdown));
 
     if let Err(e) = graceful.await {
         error!("HTTP server error: {}", e);
@@ -519,7 +550,7 @@ pub async fn serve(settings: &Settings) -> Result<()> {
 }
 
 /// Wait for shutdown signal (Ctrl+C)
-async fn wait_for_shutdown() {
+async fn wait_for_shutdown(orchestrator: Arc<RwLock<Orchestrator>>) {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
@@ -540,6 +571,10 @@ async fn wait_for_shutdown() {
     {
         // For Windows, we can use a simple approach
         tokio::time::sleep(tokio::time::Duration::from_secs(u64::MAX)).await;
+    }
+
+    if let Err(e) = orchestrator.write().await.shutdown().await {
+        error!("Error during orchestrator shutdown: {}", e);
     }
 }
 
