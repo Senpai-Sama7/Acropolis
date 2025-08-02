@@ -106,15 +106,6 @@ impl Agent for ZigAgent {
         "zig"
     }
 
-    fn agent_type(&self) -> &str {
-        "native_utility"
-    }
-
-    async fn health_check(&self) -> Result<crate::agent::AgentHealth> {
-        // Zig FFI is synchronous and stateless, so it's always healthy if the library is loaded.
-        Ok(crate::agent::AgentHealth::default())
-    }
-
     #[instrument(skip(self, memory), fields(agent = "zig"))]
     async fn handle(&self, input: serde_json::Value, _memory: Arc<Memory>) -> Result<String> {
         // Parse and validate input JSON structure
