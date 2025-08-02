@@ -280,7 +280,7 @@ impl Agent for QLearningAgent {
             uptime_seconds: self.start_time.elapsed().as_secs(),
             total_requests: self.request_count.load(Ordering::Relaxed),
             error_count: self.error_count.load(Ordering::Relaxed),
-            average_response_time_ms: 1.0,
+            average_response_time_ms: 0.0,
         })
     }
 }
