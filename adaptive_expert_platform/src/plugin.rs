@@ -318,7 +318,7 @@ mod tests {
         assert!(config.allowed_extensions.contains(".so"));
         assert!(config.allowed_extensions.contains(".dll"));
         assert!(config.allowed_extensions.contains(".dylib"));
-        assert_eq!(config.max_plugin_size, 50 * 1024 * 1024);
+        assert_eq!(config.max_plugin_size, 10 * 1024 * 1024);
         assert!(config.require_signatures);
     }
 
