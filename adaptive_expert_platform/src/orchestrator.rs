@@ -216,9 +216,20 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Get list of registered agent names
-    pub async fn list_agents(&self) -> Vec<String> {
-        self.agents.lock().await.keys().cloned().collect()
+    /// Get list of registered agents with their types
+    pub async fn list_agents(&self) -> Vec<(String, String)> {
+        let agents_map = self.agents.lock().await;
+        agents_map.iter()
+            .map(|(name, agent)| (name.clone(), agent.agent_type().to_string()))
+            .collect()
+    }
+
+    /// Remove a registered agent
+    #[instrument(skip(self))]
+    pub async fn remove_agent(&self, name: &str) -> Result<()> {
+        info!("Removing agent: {}", name);
+        self.agents.lock().await.remove(name);
+        Ok(())
     }
 
     /// Get plugin security configuration
