@@ -2,14 +2,16 @@
 
 #[cfg(feature = "with-julia")]
 mod julia_impl {
-    use crate::{agent::Agent, memory::Memory};
+    use crate::{agent::Agent, memory::Memory, settings::Settings};
     use anyhow::{anyhow, Result};
     use async_trait::async_trait;
     use jlrs::prelude::*;
     use serde_json::Value;
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::{mpsc::Sender, oneshot::channel};
-    use tracing::{info, error};
+    use tracing::{info, error, warn};
 
     pub struct JuliaTask {
         pub function_name: String,
@@ -17,8 +19,35 @@ mod julia_impl {
         pub response: oneshot::Sender<Result<String>>,
     }
 
+    /// Validate the integrity of the model file by checking its hash
+    fn validate_model_integrity(path: &str, allowlist: &HashMap<String, String>) -> Result<()> {
+        if allowlist.is_empty() {
+            warn!("Script allowlist is empty. Skipping integrity check for {}", path);
+            return Ok(());
+        }
+
+        let expected_hash = allowlist.get(path)
+            .ok_or_else(|| anyhow!("Model '{}' is not in the allowlist", path))?;
+
+        let file_content = std::fs::read(path)?;
+        let mut hasher = Sha256::new();
+        hasher.update(&file_content);
+        let actual_hash = format!("{:x}", hasher.finalize());
+
+        if actual_hash != *expected_hash {
+            return Err(anyhow!(
+                "Model integrity check failed for '{}'. Expected hash: {}, Actual hash: {}",
+                path,
+                expected_hash,
+                actual_hash
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Initialize Julia runtime in a dedicated thread with bounded queue for concurrency control
-    fn init_julia() -> Result<Sender<JuliaTask>> {
+    fn init_julia(settings: Settings) -> Result<Sender<JuliaTask>> {
         // Use a bounded channel with backpressure to limit concurrent Julia tasks
         let (tx, mut rx) = tokio::sync::mpsc::channel::<JuliaTask>(100);
 
@@ -34,6 +63,11 @@ mod julia_impl {
                 // Load model files if they exist
                 for model_path in &["models/julia/causal_model.jl", "models/julia/ltn_logic.jl"] {
                     if std::path::Path::new(model_path).exists() {
+                        // Validate integrity before loading
+                        if let Err(e) = validate_model_integrity(model_path, &settings.security.script_allowlist_hashes) {
+                            error!("Integrity check failed for Julia model '{}': {}", model_path, e);
+                            continue;
+                        }
                         include.call1(&mut frame, Value::new(&mut frame, model_path))?;
                         info!("Loaded Julia model: {}", model_path);
                     }
@@ -84,8 +118,8 @@ mod julia_impl {
     }
 
     impl JuliaAgent {
-        pub fn new() -> Result<Self> {
-            let sender = init_julia()?;
+        pub fn new(settings: &Settings) -> Result<Self> {
+            let sender = init_julia(settings.clone())?;
             Ok(Self { sender })
         }
     }
