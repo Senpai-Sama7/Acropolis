@@ -294,7 +294,10 @@ async fn search_memory(
 
     let memory = state.orchestrator.read().await.memory();
     let results = memory.search_memory(query, 10).await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            error!("Memory search failed: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     Ok(Json(results))
 }
@@ -311,7 +314,10 @@ async fn add_memory(
 
     let memory = state.orchestrator.read().await.memory();
     memory.add_memory(content).await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            error!("Failed to add to memory: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
     Ok(StatusCode::CREATED)
 }

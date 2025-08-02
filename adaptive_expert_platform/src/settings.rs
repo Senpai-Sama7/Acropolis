@@ -24,11 +24,11 @@ impl Default for ServerConfig {
         Self {
             host: "127.0.0.1".to_string(),
             port: 8080,
-            max_connections: 1000,
+            max_connections: 1_000,
             request_timeout_seconds: 30,
             enable_cors: true,
             cors_origins: vec!["*".to_string()],
-            rate_limit_per_minute: 1000,
+            rate_limit_per_minute: 1_000,
         }
     }
 }
@@ -130,7 +130,7 @@ impl Default for MemoryConfig {
             max_fragments: 10_000,
             embedding_dim: 384,
             similarity_threshold: 0.1,
-            cache_size: 1000,
+            cache_size: 1_000,
             enable_persistence: false,
             persistence_path: None,
         }
@@ -163,7 +163,7 @@ impl Default for LlmConfig {
         let mut models = HashMap::new();
         models.insert("default".to_string(), LlmModelConfig {
             path: "models/llama-2-7b.gguf".to_string(),
-            context_size: 2048,
+            context_size: 2_048,
             max_tokens: 512,
             temperature: 0.7,
             top_p: 0.9,
