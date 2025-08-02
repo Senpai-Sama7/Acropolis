@@ -230,8 +230,6 @@ async fn execute_task(
     let start_time = std::time::Instant::now();
     let orchestrator = state.orchestrator.read().await;
 
-    // Create a dummy memory for now
-    let dummy_memory = Arc::new(create_dummy_memory());
     let (resp_tx, mut resp_rx) = tokio::sync::mpsc::channel(1);
 
     orchestrator.dispatch((
@@ -292,9 +290,8 @@ async fn search_memory(
         .and_then(|v| v.as_str())
         .ok_or(StatusCode::BAD_REQUEST)?;
 
-    // TODO: Use actual memory instance
-    let dummy_memory = create_dummy_memory();
-    let results = dummy_memory.search_memory(query, 10).await
+    let memory = state.orchestrator.read().await.memory();
+    let results = memory.search_memory(query, 10).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(results))
@@ -310,9 +307,8 @@ async fn add_memory(
         .and_then(|v| v.as_str())
         .ok_or(StatusCode::BAD_REQUEST)?;
 
-    // TODO: Use actual memory instance
-    let dummy_memory = create_dummy_memory();
-    dummy_memory.add_memory(content).await
+    let memory = state.orchestrator.read().await.memory();
+    memory.add_memory(content).await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(StatusCode::CREATED)
@@ -453,9 +449,12 @@ pub async fn serve(settings: &Settings) -> Result<()> {
     validate_jwt_secret_startup(settings)?;
 
     // Create application state
-    let memory = Arc::new(create_dummy_memory());
+    let memory_cache = Arc::new(crate::memory::redis_store::InMemoryEmbeddingCache::new());
+    let echo_agent = Arc::new(crate::agent::EchoAgent::new());
+    let memory = Arc::new(Memory::new(echo_agent.clone(), echo_agent, memory_cache));
+
     let orchestrator = Arc::new(RwLock::new(
-        Orchestrator::new(&settings, memory).await
+        Orchestrator::new(&settings, memory.clone()).await
             .map_err(|e| {
                 error!("Failed to initialize orchestrator: {}", e);
                 anyhow::anyhow!("Orchestrator initialization failed")
