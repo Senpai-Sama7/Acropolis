@@ -52,7 +52,13 @@ mod julia_impl {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<JuliaTask>(100);
 
         std::thread::spawn(move || {
-            let mut julia = RuntimeBuilder::new().start().expect("Could not init Julia");
+            let mut julia = match RuntimeBuilder::new().start() {
+                Ok(julia) => julia,
+                Err(e) => {
+                    error!("Failed to initialize Julia runtime: {}", e);
+                    return;
+                }
+            };
             let mut frame = StackFrame::new();
 
             info!("Julia runtime initialized in dedicated thread");
@@ -128,6 +134,16 @@ mod julia_impl {
     impl Agent for JuliaAgent {
         fn name(&self) -> &str {
             "julia"
+        }
+
+        fn agent_type(&self) -> &str {
+            "language_model"
+        }
+
+        async fn health_check(&self) -> Result<crate::agent::AgentHealth> {
+            // For now, we assume the Julia runtime is healthy if the agent was created.
+            // A more advanced check could involve sending a task to the Julia thread.
+            Ok(crate::agent::AgentHealth::default())
         }
 
         async fn handle(&self, input: Value, _memory: Arc<Memory>) -> Result<String> {
