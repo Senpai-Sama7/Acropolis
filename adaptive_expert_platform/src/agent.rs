@@ -26,6 +26,8 @@ pub trait Agent: Send + Sync {
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentHealth {
     pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
     pub uptime_seconds: u64,
     pub total_requests: u64,
     pub error_count: u64,
@@ -36,6 +38,7 @@ impl Default for AgentHealth {
     fn default() -> Self {
         Self {
             status: "healthy".to_string(),
+            details: None,
             uptime_seconds: 0,
             total_requests: 0,
             error_count: 0,

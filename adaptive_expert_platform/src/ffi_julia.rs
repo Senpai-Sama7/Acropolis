@@ -48,11 +48,25 @@ mod julia_impl {
 
     /// Initialize Julia runtime in a dedicated thread with bounded queue for concurrency control
     fn init_julia(settings: Settings) -> Result<Sender<JuliaTask>> {
-        // Use a bounded channel with backpressure to limit concurrent Julia tasks
         let (tx, mut rx) = tokio::sync::mpsc::channel::<JuliaTask>(100);
+        let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<()>>();
 
         std::thread::spawn(move || {
-            let mut julia = RuntimeBuilder::new().start().expect("Could not init Julia");
+            let julia_res = RuntimeBuilder::new().start();
+            let mut julia = match julia_res {
+                Ok(julia) => {
+                    if init_tx.send(Ok(())).is_err() {
+                        error!("Failed to send Julia init success signal");
+                        return;
+                    }
+                    julia
+                }
+                Err(e) => {
+                    error!("Failed to initialize Julia runtime: {}", e);
+                    let _ = init_tx.send(Err(anyhow!("Failed to initialize Julia: {}", e)));
+                    return;
+                }
+            };
             let mut frame = StackFrame::new();
 
             info!("Julia runtime initialized in dedicated thread");
@@ -97,6 +111,8 @@ mod julia_impl {
             }
         });
 
+        init_rx.recv()??;
+
         Ok(tx)
     }
 
@@ -128,6 +144,20 @@ mod julia_impl {
     impl Agent for JuliaAgent {
         fn name(&self) -> &str {
             "julia"
+        }
+
+        fn agent_type(&self) -> &str {
+            "language_model"
+        }
+
+        async fn health_check(&self) -> Result<crate::agent::AgentHealth> {
+            if self.sender.is_closed() {
+                let mut health = crate::agent::AgentHealth::default();
+                health.status = "unhealthy".to_string();
+                health.details = Some("Julia runtime thread has terminated.".to_string());
+                return Ok(health);
+            }
+            Ok(crate::agent::AgentHealth::default())
         }
 
         async fn handle(&self, input: Value, _memory: Arc<Memory>) -> Result<String> {
