@@ -7,7 +7,7 @@
 //! { "action": "uppercase_many", "texts": ["foo", "bar"] }
 //! ```
 
-use adaptive_expert_platform::agent::Agent;
+use adaptive_expert_platform::agent::{Agent, AgentHealth};
 use adaptive_expert_platform::memory::Memory;
 use adaptive_expert_platform::plugin::PluginRegistrar;
 use anyhow::{anyhow, Result};
@@ -47,6 +47,14 @@ impl Agent for UppercaseAgent {
         "uppercase_agent"
     }
 
+    fn agent_type(&self) -> &str {
+        "utility"
+    }
+
+    fn capabilities(&self) -> Vec<String> {
+        vec!["uppercase".to_string()]
+    }
+
     async fn handle(&self, input: serde_json::Value, _memory: Arc<Memory>) -> Result<String> {
         // Handle both structured JSON and simple string inputs
         let request = if let Ok(req) = serde_json::from_value::<Request>(input.clone()) {
@@ -61,6 +69,10 @@ impl Agent for UppercaseAgent {
         let result = self.process(request);
         info!("Processed uppercase request, output length: {}", result.len());
         Ok(result)
+    }
+
+    async fn health_check(&self) -> Result<AgentHealth> {
+        Ok(AgentHealth::default())
     }
 }
 

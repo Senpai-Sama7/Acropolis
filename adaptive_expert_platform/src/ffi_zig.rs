@@ -110,6 +110,10 @@ impl Agent for ZigAgent {
         "native_utility"
     }
 
+    fn capabilities(&self) -> Vec<String> {
+        vec!["addition".to_string()]
+    }
+
     async fn health_check(&self) -> Result<crate::agent::AgentHealth> {
         // Zig FFI is synchronous and stateless, so it's always healthy if the library is loaded.
         Ok(crate::agent::AgentHealth::default())
