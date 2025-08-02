@@ -228,8 +228,11 @@ impl Orchestrator {
     #[instrument(skip(self))]
     pub async fn remove_agent(&self, name: &str) -> Result<()> {
         info!("Removing agent: {}", name);
-        self.agents.lock().await.remove(name);
-        Ok(())
+        if self.agents.lock().await.remove(name).is_some() {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Agent '{}' not found", name))
+        }
     }
 
     /// Get plugin security configuration
@@ -245,6 +248,11 @@ impl Orchestrator {
     /// Get a clone of the memory system
     pub fn memory(&self) -> Arc<Memory> {
         self.memory.clone()
+    }
+
+    /// Get the number of memory fragments
+    pub async fn get_memory_fragment_count(&self) -> usize {
+        self.memory.get_fragment_count().await
     }
 }
 

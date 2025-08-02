@@ -147,9 +147,7 @@ async fn health_check(
     let orchestrator = state.orchestrator.read().await;
     let agent_count = orchestrator.list_agents().await.len();
     let uptime_seconds = state.start_time.elapsed().as_secs();
-
-    // In a real implementation, you would get this from the actual memory system
-    let memory_fragments = 0; // Dummy value
+    let memory_fragments = orchestrator.get_memory_fragment_count().await;
 
     let response = HealthResponse {
         status: "healthy".to_string(),
@@ -213,12 +211,16 @@ async fn remove_agent(
     Path(name): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
     let orchestrator = state.orchestrator.read().await;
-    orchestrator.remove_agent(&name).await.map_err(|e| {
-        error!("Failed to remove agent '{}': {}", name, e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    info!("Removed agent: {}", name);
-    Ok(StatusCode::NO_CONTENT)
+    match orchestrator.remove_agent(&name).await {
+        Ok(_) => {
+            info!("Removed agent: {}", name);
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Err(_) => {
+            warn!("Attempted to remove non-existent agent: {}", name);
+            Err(StatusCode::NOT_FOUND)
+        }
+    }
 }
 
 /// Execute a task with an agent
