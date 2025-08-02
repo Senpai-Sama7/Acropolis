@@ -453,7 +453,9 @@ pub async fn serve(settings: &Settings) -> Result<()> {
     validate_jwt_secret_startup(settings)?;
 
     // Create application state
-    let memory = Arc::new(create_dummy_memory());
+    let memory_cache = Arc::new(crate::memory::redis_store::InMemoryEmbeddingCache::new());
+    let echo_agent = Arc::new(crate::agent::EchoAgent::new());
+    let memory = Arc::new(Memory::new(echo_agent.clone(), echo_agent, memory_cache));
     let orchestrator = Arc::new(RwLock::new(
         Orchestrator::new(&settings, memory).await
             .map_err(|e| {
