@@ -241,11 +241,6 @@ impl Orchestrator {
     pub fn update_plugin_security_config(&mut self, config: PluginSecurityConfig) {
         self.plugin_security_config = config;
     }
-
-    /// Get a clone of the memory system
-    pub fn memory(&self) -> Arc<Memory> {
-        self.memory.clone()
-    }
 }
 
 #[cfg(test)]
