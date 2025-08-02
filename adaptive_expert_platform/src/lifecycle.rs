@@ -279,7 +279,6 @@ impl LifecycleManager {
     pub async fn shutdown_agent(&self, id: Uuid) -> Result<()> {
         let mut deployment = String::new();
         if let Some(mut inst) = self.instances.get_mut(&id) {
-            inst.state = AgentState::Stopping;
             inst.state = AgentState::Stopped;
             deployment = inst.deployment_name.clone();
         }
