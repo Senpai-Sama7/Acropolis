@@ -40,10 +40,10 @@ async fn init_admin(username: String, password: Option<String>, settings: &Setti
     
     let db_path = settings.db_path.clone().unwrap_or_else(|| "./acropolis_db/auth".to_string());
     let jwt_secret = get_jwt_secret(settings)?;
-    let auth_manager = AuthManager::new(jwt_secret, &db_path)?;
+    let auth_manager = AuthManager::new(jwt_secret, &db_path).await?;
     
     // Check if admin already exists
-    if auth_manager.has_admin()? {
+    if auth_manager.has_admin().await? {
         return Err(anyhow::anyhow!("Admin user already exists. Cannot reinitialize."));
     }
     
@@ -61,7 +61,7 @@ async fn init_admin(username: String, password: Option<String>, settings: &Setti
         return Err(anyhow::anyhow!("Password must be at least 12 characters long"));
     }
     
-    auth_manager.initialize_admin(username, &password)?;
+    auth_manager.initialize_admin(username, &password).await?;
     println!("Admin user initialized successfully");
     Ok(())
 }

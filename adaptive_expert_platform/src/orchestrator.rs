@@ -6,6 +6,8 @@ use anyhow::Result;
 use serde_json::Value;
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tracing::{info, warn, error, instrument};
+use uuid::Uuid;
+use dashmap::DashMap;
 
 use crate::{
     agent::Agent,
@@ -14,7 +16,6 @@ use crate::{
     memory::Memory,
     lifecycle::{LifecycleManager, LifecycleConfig},
     monitoring::{MonitoringSystem, MonitoringConfig},
-    cache::{MultiTierCache, MultiTierCacheConfig},
     websocket::{WebSocketServer, WebSocketConfig},
     mesh::{AgentMesh, MeshConfig},
 };
@@ -23,6 +24,7 @@ type Task = (String, Value, mpsc::Sender<Result<Value>>);
 
 pub struct Orchestrator {
     agents: Arc<Mutex<HashMap<String, Arc<dyn Agent>>>>,
+    agent_instances: Arc<Mutex<HashMap<String, Uuid>>>,
     memory: Arc<Memory>,
     plugin_security_config: PluginSecurityConfig,
     task_semaphore: Arc<Semaphore>,
@@ -32,7 +34,7 @@ pub struct Orchestrator {
     // Advanced systems
     lifecycle_manager: Arc<LifecycleManager>,
     monitoring_system: Arc<MonitoringSystem>,
-    cache_system: Arc<MultiTierCache>,
+    agent_type_cache: Arc<DashMap<String, String>>,
     websocket_server: Arc<WebSocketServer>,
     agent_mesh: Option<Arc<AgentMesh>>,
 }
@@ -42,6 +44,7 @@ impl Orchestrator {
     pub async fn new(settings: &Settings, memory: Arc<Memory>) -> Result<Self> {
         let (bus_tx, mut bus_rx) = mpsc::channel(16);
         let agents = Arc::new(Mutex::new(HashMap::new()));
+        let agent_instances = Arc::new(Mutex::new(HashMap::new()));
 
         // Initialize plugin security configuration from settings
         let plugin_security_config = PluginSecurityConfig::from_security_config(&settings.security);
@@ -55,7 +58,6 @@ impl Orchestrator {
         // Initialize advanced systems
         let lifecycle_manager = Arc::new(LifecycleManager::new(LifecycleConfig::default()));
         let monitoring_system = Arc::new(MonitoringSystem::new(MonitoringConfig::default()));
-        let cache_system = Arc::new(MultiTierCache::new(MultiTierCacheConfig::default()).await?);
         let websocket_server = Arc::new(WebSocketServer::new(WebSocketConfig::default()));
         
         // Initialize agent mesh if enabled (optional)
@@ -139,6 +141,7 @@ impl Orchestrator {
 
         Ok(Self {
             agents,
+            agent_instances,
             memory,
             plugin_security_config,
             task_semaphore,
@@ -146,7 +149,7 @@ impl Orchestrator {
             _bus: bus_tx,
             lifecycle_manager,
             monitoring_system,
-            cache_system,
+            agent_type_cache: Arc::new(DashMap::new()),
             websocket_server,
             agent_mesh,
         })
@@ -184,6 +187,7 @@ impl Orchestrator {
 
         // Execute agent with timeout and error handling
         let memory_clone = self.memory.clone();
+        let start = std::time::Instant::now();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(30), // 30 second timeout
             agent.handle(input, memory_clone)
@@ -193,17 +197,29 @@ impl Orchestrator {
             Ok(Ok(output)) => Ok(Value::String(output)),
             Ok(Err(e)) => {
                 error!("Agent '{}' execution failed: {}", name, e);
+                self.monitoring_system
+                    .record_agent_request(&name, false, start.elapsed())
+                    .await;
                 Err(e)
             }
             Err(_) => {
                 error!("Agent '{}' execution timed out", name);
+                self.monitoring_system
+                    .record_agent_request(&name, false, start.elapsed())
+                    .await;
                 Err(anyhow::anyhow!("Agent execution timed out"))
             }
         };
 
+        if response.is_ok() {
+            self.monitoring_system
+                .record_agent_request(&name, true, start.elapsed())
+                .await;
+        }
+
         // Release permit automatically when it goes out of scope
         drop(permit);
-        
+
         let _ = resp_tx.send(response).await;
         Ok(())
     }
@@ -212,7 +228,14 @@ impl Orchestrator {
     #[instrument(skip(self, agent))]
     pub async fn register_agent(&self, name: String, agent: Arc<dyn Agent>) -> Result<()> {
         info!("Registering built-in agent: {}", name);
-        self.agents.lock().await.insert(name, agent);
+        let agent_type = agent.agent_type().to_string();
+        self.agents.lock().await.insert(name.clone(), agent);
+        let instance_id = self
+            .lifecycle_manager
+            .register_agent_instance(&name)
+            .await?;
+        self.agent_instances.lock().await.insert(name.clone(), instance_id);
+        self.agent_type_cache.insert(name, agent_type);
         Ok(())
     }
 
@@ -229,6 +252,10 @@ impl Orchestrator {
     pub async fn remove_agent(&self, name: &str) -> Result<()> {
         info!("Removing agent: {}", name);
         if self.agents.lock().await.remove(name).is_some() {
+            if let Some(id) = self.agent_instances.lock().await.remove(name) {
+                let _ = self.lifecycle_manager.shutdown_agent(id).await;
+            }
+            self.agent_type_cache.remove(name);
             Ok(())
         } else {
             Err(anyhow::anyhow!("Agent '{}' not found", name))
@@ -248,6 +275,16 @@ impl Orchestrator {
     /// Get a clone of the memory system
     pub fn memory(&self) -> Arc<Memory> {
         self.memory.clone()
+    }
+
+    /// Get monitoring system handle
+    pub fn monitoring(&self) -> Arc<MonitoringSystem> {
+        self.monitoring_system.clone()
+    }
+
+    /// Gracefully shutdown all running agents
+    pub async fn shutdown(&self) -> Result<()> {
+        self.lifecycle_manager.shutdown_all().await
     }
 
     /// Get the number of memory fragments

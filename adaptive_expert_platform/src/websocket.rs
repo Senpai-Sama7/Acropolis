@@ -19,6 +19,7 @@ use axum::{
     response::IntoResponse,
 };
 use axum_extra::extract::cookie::{CookieJar, Cookie};
+use futures::stream::SplitSink;
 
 /// WebSocket connection information
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -226,6 +227,7 @@ pub struct WebSocketServer {
 }
 
 #[derive(Debug, Default, Serialize)]
+#[derive(Default, Clone)]
 pub struct WebSocketStats {
     pub total_connections: u64,
     pub active_connections: usize,
@@ -276,9 +278,10 @@ impl WebSocketServer {
         cookies: CookieJar,
     ) -> impl IntoResponse {
         // Extract authentication info
-        let auth_token = query.get("token")
-            .or_else(|| cookies.get("auth_token").map(|c| c.value()))
-            .map(|s| s.to_string());
+        let auth_token = query
+            .get("token")
+            .cloned()
+            .or_else(|| cookies.get("auth_token").map(|c| c.value().to_string()));
 
         // Check connection limits
         if self.connections.len() >= self.config.max_connections {
@@ -326,7 +329,7 @@ impl WebSocketServer {
         info!("New WebSocket connection established: {}", connection_id);
 
         // Spawn message sender task
-        let ws_sender = Arc::new(tokio::sync::Mutex::new(ws_sender));
+        let ws_sender: Arc<tokio::sync::Mutex<SplitSink<WebSocket, Message>>> = Arc::new(tokio::sync::Mutex::new(ws_sender));
         let sender_task = {
             let ws_sender = ws_sender.clone();
             let stats = self.stats.clone();
@@ -469,7 +472,7 @@ impl WebSocketServer {
             conn.session_id = payload.session_id;
             
             // Authenticate if token provided
-            if let Some(token) = payload.auth_token {
+            if let Some(_token) = payload.auth_token {
                 // Implement authentication logic here
                 conn.user_id = Some("authenticated_user".to_string());
             }

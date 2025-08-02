@@ -8,6 +8,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
 use tracing::{info, warn, error, instrument};
+use blake3::Hasher;
 
 #[cfg(feature = "with-llama")]
 use llama_cpp::{standard_sampler, LlamaModel, LlamaParams, SessionParams};
@@ -95,6 +96,166 @@ impl Agent for EchoAgent {
             total_requests: requests,
             error_count: errors,
             average_response_time_ms: 1.0, // Echo is very fast
+        })
+    }
+}
+
+/// Deterministic hashing-based embedding agent
+pub struct HashEmbeddingAgent {
+    request_count: std::sync::atomic::AtomicU64,
+    error_count: std::sync::atomic::AtomicU64,
+    start_time: std::time::Instant,
+    dimension: usize,
+}
+
+impl HashEmbeddingAgent {
+    pub fn new(dimension: usize) -> Self {
+        Self {
+            request_count: std::sync::atomic::AtomicU64::new(0),
+            error_count: std::sync::atomic::AtomicU64::new(0),
+            start_time: std::time::Instant::now(),
+            dimension,
+        }
+    }
+}
+
+#[async_trait]
+impl Agent for HashEmbeddingAgent {
+    fn name(&self) -> &str { "hash_embedding" }
+
+    fn agent_type(&self) -> &str { "embedding" }
+
+    fn capabilities(&self) -> Vec<String> {
+        vec!["embedding".to_string()]
+    }
+
+    async fn handle(&self, input: serde_json::Value, _memory: Arc<Memory>) -> Result<String> {
+        self.request_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let text = input
+            .get("text")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                self.error_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                anyhow!("Missing 'text' field for embedding agent")
+            })?;
+
+        // Produce deterministic pseudo-random embedding based on blake3 hashing
+        let mut seed_hasher = Hasher::new();
+        seed_hasher.update(text.as_bytes());
+        let mut seed = seed_hasher.finalize().as_bytes().to_vec();
+        let mut embedding = Vec::with_capacity(self.dimension);
+
+        while embedding.len() < self.dimension {
+            let mut h = Hasher::new();
+            h.update(&seed);
+            let digest = h.finalize();
+            seed = digest.as_bytes().to_vec();
+
+            for chunk in seed.chunks(4) {
+                if embedding.len() == self.dimension { break; }
+                let mut arr = [0u8; 4];
+                arr[..chunk.len()].copy_from_slice(chunk);
+                let v = u32::from_le_bytes(arr) as f32 / u32::MAX as f32;
+                embedding.push(v);
+            }
+        }
+
+        Ok(serde_json::to_string(&embedding)?)
+    }
+
+    async fn health_check(&self) -> Result<AgentHealth> {
+        Ok(AgentHealth {
+            status: "healthy".to_string(),
+            details: None,
+            uptime_seconds: self.start_time.elapsed().as_secs(),
+            total_requests: self
+                .request_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            error_count: self
+                .error_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            average_response_time_ms: 1.0,
+        })
+    }
+}
+
+/// Simple reranking agent that orders candidates by length similarity to the query
+pub struct LengthRerankAgent {
+    request_count: std::sync::atomic::AtomicU64,
+    error_count: std::sync::atomic::AtomicU64,
+    start_time: std::time::Instant,
+}
+
+impl LengthRerankAgent {
+    pub fn new() -> Self {
+        Self {
+            request_count: std::sync::atomic::AtomicU64::new(0),
+            error_count: std::sync::atomic::AtomicU64::new(0),
+            start_time: std::time::Instant::now(),
+        }
+    }
+}
+
+#[async_trait]
+impl Agent for LengthRerankAgent {
+    fn name(&self) -> &str { "length_rerank" }
+
+    fn agent_type(&self) -> &str { "rerank" }
+
+    fn capabilities(&self) -> Vec<String> {
+        vec!["rerank".to_string()]
+    }
+
+    async fn handle(&self, input: serde_json::Value, _memory: Arc<Memory>) -> Result<String> {
+        self.request_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let query = input
+            .get("query")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                self.error_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                anyhow!("Missing 'query' field for rerank agent")
+            })?;
+
+        let candidates = input
+            .get("candidates")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                self.error_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                anyhow!("Missing 'candidates' field for rerank agent")
+            })?;
+
+        let mut cand_strings: Vec<String> = candidates
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+
+        cand_strings.sort_by_key(|c| {
+            let diff = c.len() as i64 - query.len() as i64;
+            diff.abs()
+        });
+
+        Ok(serde_json::to_string(&cand_strings)?)
+    }
+
+    async fn health_check(&self) -> Result<AgentHealth> {
+        Ok(AgentHealth {
+            status: "healthy".to_string(),
+            details: None,
+            uptime_seconds: self.start_time.elapsed().as_secs(),
+            total_requests: self
+                .request_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            error_count: self
+                .error_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            average_response_time_ms: 1.0,
         })
     }
 }

@@ -7,7 +7,7 @@
 /// ```
 /// Evaluates `code` inside a sandboxed Julia environment and returns its string representation.
 
-use adaptive_expert_platform::agent::Agent;
+use adaptive_expert_platform::agent::{Agent, AgentHealth};
 use adaptive_expert_platform::memory::Memory;
 use adaptive_expert_platform::plugin::PluginRegistrar;
 use anyhow::{anyhow, Result};
@@ -268,6 +268,14 @@ impl Agent for JuliaAgent {
         "julia_agent"
     }
 
+    fn agent_type(&self) -> &str {
+        "julia"
+    }
+
+    fn capabilities(&self) -> Vec<String> {
+        vec!["julia_execute".to_string()]
+    }
+
     #[instrument(skip(self, input, _memory), fields(code_length))]
     async fn handle(&self, input: Value, _memory: Arc<Memory>) -> Result<String> {
         // Parse input structure
@@ -322,6 +330,10 @@ impl Agent for JuliaAgent {
                 Err(anyhow!("Julia execution timed out"))
             }
         }
+    }
+
+    async fn health_check(&self) -> Result<AgentHealth> {
+        Ok(AgentHealth::default())
     }
 }
 

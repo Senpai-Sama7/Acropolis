@@ -1,7 +1,6 @@
 //! Enhanced memory system with real embeddings and improved performance.
 
 use anyhow::{anyhow, Result};
-use async_trait::async_trait;
 use blake3::Hasher;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -302,25 +301,6 @@ pub struct MemoryStats {
     pub similarity_threshold: f32,
 }
 
-/// Embedding cache trait
-#[async_trait]
-pub trait EmbeddingCache: Send + Sync {
-    async fn get(&self, key: &str) -> Result<Option<Vec<f32>>>;
-    async fn set(&self, key: &str, embedding: &[f32]) -> Result<()>;
-    async fn delete(&self, key: &str) -> Result<()>;
-    async fn clear(&self) -> Result<()>;
-    async fn stats(&self) -> CacheStats;
-}
-
-/// Cache statistics
-#[derive(Debug, Clone, Serialize)]
-pub struct CacheStats {
-    pub hits: u64,
-    pub misses: u64,
-    pub entries: usize,
-    pub memory_usage_bytes: u64,
-}
-
 /// Create a Blake3 hash key for content.
 fn cache_key(content: &str) -> String {
     let mut hasher = Hasher::new();
@@ -345,14 +325,15 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-// Re-export the redis store module
+// Re-export the redis store module and core traits
 pub mod redis_store;
+pub use redis_store::{EmbeddingCache, CacheStats};
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::memory::redis_store::InMemoryEmbeddingCache;
-    use crate::agent::EchoAgent;
+    use crate::agent::{HashEmbeddingAgent, LengthRerankAgent};
 
     #[tokio::test]
     async fn test_cache_key_generation() {
@@ -386,55 +367,57 @@ mod tests {
     #[tokio::test]
     async fn test_memory_kv_operations() {
         let cache = Arc::new(InMemoryEmbeddingCache::new());
-        let echo_agent = Arc::new(EchoAgent);
-        let memory = Memory::new(echo_agent.clone(), echo_agent, cache);
+        let embed = Arc::new(HashEmbeddingAgent::new(384));
+        let rerank = Arc::new(LengthRerankAgent::new());
+        let memory = Memory::new(embed, rerank, cache);
 
         // Test set and get
         let key = "test_key";
         let value = serde_json::json!({"data": "test_value"});
 
-        memory.set_kv(key, value.clone()).unwrap();
-        let retrieved = memory.get_kv(key).unwrap();
+        memory.set_kv(key, value.clone()).await.unwrap();
+        let retrieved = memory.get_kv(key).await.unwrap();
 
         assert_eq!(retrieved, Some(value));
 
         // Test non-existent key
-        let missing = memory.get_kv("nonexistent").unwrap();
+        let missing = memory.get_kv("nonexistent").await.unwrap();
         assert_eq!(missing, None);
     }
 
     #[tokio::test]
     async fn test_memory_stats() {
         let cache = Arc::new(InMemoryEmbeddingCache::new());
-        let echo_agent = Arc::new(EchoAgent);
-        let memory = Memory::new(echo_agent.clone(), echo_agent, cache)
+        let embed = Arc::new(HashEmbeddingAgent::new(384));
+        let rerank = Arc::new(LengthRerankAgent::new());
+        let memory = Memory::new(embed, rerank, cache)
             .with_max_fragments(100);
 
-        let stats = memory.stats().await.unwrap();
+        let stats = memory.stats().await;
         assert_eq!(stats.total_fragments, 0);
-        assert_eq!(stats.max_fragments, 100);
-        assert_eq!(stats.kv_pairs, 0);
+        assert_eq!(stats.cache_hits, 0);
+        assert_eq!(stats.cache_misses, 0);
     }
 
     #[tokio::test]
     async fn test_memory_clear() {
         let cache = Arc::new(InMemoryEmbeddingCache::new());
-        let echo_agent = Arc::new(EchoAgent);
-        let memory = Memory::new(echo_agent.clone(), echo_agent, cache);
+        let embed = Arc::new(HashEmbeddingAgent::new(384));
+        let rerank = Arc::new(LengthRerankAgent::new());
+        let memory = Memory::new(embed, rerank, cache);
 
         // Add some data
-        memory.set_kv("key1", serde_json::json!("value1")).unwrap();
-        memory.set_kv("key2", serde_json::json!("value2")).unwrap();
+        memory.set_kv("key1", serde_json::json!("value1")).await.unwrap();
+        memory.set_kv("key2", serde_json::json!("value2")).await.unwrap();
 
         // Clear everything
         memory.clear().await.unwrap();
 
         // Verify everything is cleared
-        let stats = memory.stats().await.unwrap();
+        let stats = memory.stats().await;
         assert_eq!(stats.total_fragments, 0);
-        assert_eq!(stats.kv_pairs, 0);
 
-        assert_eq!(memory.get_kv("key1").unwrap(), None);
-        assert_eq!(memory.get_kv("key2").unwrap(), None);
+        assert_eq!(memory.get_kv("key1").await.unwrap(), None);
+        assert_eq!(memory.get_kv("key2").await.unwrap(), None);
     }
 }

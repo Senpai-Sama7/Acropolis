@@ -5,7 +5,6 @@
 pub mod agent;
 pub mod auth;
 pub mod batch;
-pub mod cache;
 pub mod cli;
 pub mod lifecycle;
 pub mod memory;
