@@ -61,8 +61,8 @@ async fn init_admin(username: String, password: Option<String>, settings: &Setti
         return Err(anyhow::anyhow!("Password must be at least 12 characters long"));
     }
     
-    auth_manager.initialize_admin(username.clone(), &password)?;
-    println!("Admin user '{}' initialized successfully", username);
+    auth_manager.initialize_admin(username, &password)?;
+    println!("Admin user initialized successfully");
     Ok(())
 }
 
