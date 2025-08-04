@@ -22,7 +22,7 @@ use anyhow::{anyhow, Result};
 #[cfg(feature = "wasm")]
 use once_cell::sync::Lazy;
 #[cfg(feature = "wasm")]
-use wasmtime::{component::Component, Config, Engine, Store};
+use wasmtime::{component::Component, Config, Engine, Store, StoreLimitsBuilder};
 #[cfg(feature = "wasm")]
 use wasmtime::component::{Instance, Linker, TypedFunc};
 #[cfg(feature = "wasm")]
@@ -37,6 +37,7 @@ static ENGINE: Lazy<Engine> = Lazy::new(|| {
     let mut config = Config::default();
     config.wasm_component_model(true);
     config.parallel_compilation(true);
+    config.consume_fuel(true);
     Engine::new(&config).expect("Failed to create Wasmtime engine")
 });
 
@@ -56,6 +57,15 @@ impl WasmPluginManager {
             .map_err(|e| anyhow!("Failed to compile Wasm component {}: {}", path.display(), e))?;
         let mut linker: Linker<()> = Linker::new(&*ENGINE);
         let mut store: Store<()> = Store::new(&*ENGINE, ());
+
+        // Limit fuel and memory to prevent abuse
+        store
+            .add_fuel(1_000_000)
+            .map_err(|e| anyhow!("Failed to add fuel: {}", e))?;
+        let mut limits = StoreLimitsBuilder::new()
+            .memory_size(10 * 1024 * 1024) // 10 MiB
+            .build();
+        store.limiter(|_| Some(&mut limits));
         // Instantiate the component.  Because we don't define any
         // imports the host side has no functions to expose.
         let (instance, _) = Instance::new_async(&mut store, &component, &linker)

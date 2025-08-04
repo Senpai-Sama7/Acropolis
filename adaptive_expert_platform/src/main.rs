@@ -7,6 +7,7 @@ use adaptive_expert_platform::{
 use anyhow::Result;
 use clap::Parser;
 use rpassword::read_password;
+use secrecy::{Secret, ExposeSecret};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -40,10 +41,10 @@ async fn init_admin(username: String, password: Option<String>, settings: &Setti
     
     let db_path = settings.db_path.clone().unwrap_or_else(|| "./acropolis_db/auth".to_string());
     let jwt_secret = get_jwt_secret(settings)?;
-    let auth_manager = AuthManager::new(jwt_secret, &db_path)?;
+    let auth_manager = AuthManager::new(jwt_secret, &db_path, &settings.security).await?;
     
     // Check if admin already exists
-    if auth_manager.has_admin()? {
+    if auth_manager.has_admin().await? {
         return Err(anyhow::anyhow!("Admin user already exists. Cannot reinitialize."));
     }
     
@@ -61,7 +62,7 @@ async fn init_admin(username: String, password: Option<String>, settings: &Setti
         return Err(anyhow::anyhow!("Password must be at least 12 characters long"));
     }
     
-    auth_manager.initialize_admin(username, &password)?;
+    auth_manager.initialize_admin(username, &password).await?;
     println!("Admin user initialized successfully");
     Ok(())
 }
@@ -69,9 +70,10 @@ async fn init_admin(username: String, password: Option<String>, settings: &Setti
 /// Validate JWT secret meets security requirements
 fn validate_jwt_secret(settings: &Settings) -> Result<()> {
     let jwt_secret = get_jwt_secret(settings)?;
-    
+    let secret_str = jwt_secret.expose_secret();
+
     // Check minimum length
-    if jwt_secret.len() < 32 {
+    if secret_str.len() < 32 {
         return Err(anyhow::anyhow!("JWT secret must be at least 32 characters long"));
     }
     
@@ -84,12 +86,12 @@ fn validate_jwt_secret(settings: &Settings) -> Result<()> {
         "insecure",
     ];
     
-    if weak_secrets.contains(&jwt_secret.as_str()) {
+    if weak_secrets.contains(&secret_str.as_str()) {
         return Err(anyhow::anyhow!("JWT secret is using a known weak value. Please use a strong, random secret."));
     }
     
     // Basic entropy check - ensure it's not all the same character
-    let unique_chars: std::collections::HashSet<char> = jwt_secret.chars().collect();
+    let unique_chars: std::collections::HashSet<char> = secret_str.chars().collect();
     if unique_chars.len() < 4 {
         return Err(anyhow::anyhow!("JWT secret lacks sufficient entropy. Use a random, complex secret."));
     }
@@ -98,8 +100,9 @@ fn validate_jwt_secret(settings: &Settings) -> Result<()> {
 }
 
 /// Get JWT secret from settings or environment
-fn get_jwt_secret(settings: &Settings) -> Result<String> {
+fn get_jwt_secret(settings: &Settings) -> Result<Secret<String>> {
     settings.security.jwt_secret.clone()
         .or_else(|| std::env::var("AEP_JWT_SECRET").ok())
+        .map(Secret::new)
         .ok_or_else(|| anyhow::anyhow!("JWT secret must be provided via AEP_JWT_SECRET environment variable or config file"))
 }

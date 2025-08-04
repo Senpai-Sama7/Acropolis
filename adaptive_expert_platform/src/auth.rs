@@ -11,8 +11,12 @@ use axum::{
 };
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use sqlx::{sqlite::{SqlitePool, SqlitePoolOptions}, Row};
+use std::{sync::Arc, time::{Duration, Instant}};
 use tracing::{error, info, warn};
+use dashmap::DashMap;
+use secrecy::{Secret, ExposeSecret};
+use crate::settings::SecurityConfig;
 
 /// JWT claims structure
 #[derive(Debug, Serialize, Deserialize)]
@@ -33,59 +37,67 @@ pub struct User {
     pub active: bool,
 }
 
-/// Authentication manager using a persistent sled database
+/// Authentication manager backed by an asynchronous SQLite database with caching
 #[derive(Clone)]
 pub struct AuthManager {
-    db: Arc<sled::Db>,
-    jwt_secret: String,
+    pool: SqlitePool,
+    cache: Arc<DashMap<String, User>>,
+    jwt_secret: Secret<String>,
     jwt_expiry_hours: usize,
+    token_blacklist: Arc<DashMap<String, usize>>,
+    login_attempts: Arc<DashMap<String, (u32, Option<Instant>)>>,
+    max_login_attempts: u32,
+    lockout_duration: Duration,
 }
 
 impl AuthManager {
-    /// Creates a new AuthManager, opening or creating a sled database at the given path.
-    pub fn new(jwt_secret: String, db_path: &str) -> Result<Self> {
-        let db = sled::open(db_path)
-            .map_err(|e| anyhow!("Failed to open auth database at '{}': {}", db_path, e))?;
-        info!("Authentication database opened at '{}'", db_path);
+    /// Creates a new AuthManager with an asynchronous SQLite pool.
+    pub async fn new(jwt_secret: Secret<String>, db_url: &str, security: &SecurityConfig) -> Result<Self> {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect(db_url)
+            .await
+            .map_err(|e| anyhow!("Failed to connect to auth database at '{}': {}", db_url, e))?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS users (\n\
+             id TEXT PRIMARY KEY,\n\
+             username TEXT NOT NULL UNIQUE,\n\
+             password_hash TEXT NOT NULL,\n\
+             roles TEXT NOT NULL,\n\
+             active INTEGER NOT NULL\n\
+            )"
+        ).execute(&pool).await?;
+
+        let cache = Arc::new(DashMap::new());
+
+        info!("Authentication database connected at '{}'", db_url);
         Ok(Self {
-            db: Arc::new(db),
+            pool,
+            cache,
             jwt_secret,
-            jwt_expiry_hours: 24, // 24 hour expiry
+            jwt_expiry_hours: security.jwt_expiry_hours,
+            token_blacklist: Arc::new(DashMap::new()),
+            login_attempts: Arc::new(DashMap::new()),
+            max_login_attempts: security.max_login_attempts,
+            lockout_duration: Duration::from_secs(security.lockout_duration_minutes * 60),
         })
     }
 
     /// Initialize the first admin user during setup
-    pub fn initialize_admin(&self, username: String, password: &str) -> Result<()> {
-        if self.has_admin()? {
+    pub async fn initialize_admin(&self, username: String, password: &str) -> Result<()> {
+        if self.has_admin().await? {
             return Err(anyhow!("Admin user already exists. Cannot reinitialize."));
         }
-
-        let password_hash = Self::hash_password(password)?;
-        let user = User {
-            id: username.clone(),
-            username: username.clone(),
-            password_hash,
-            roles: vec!["admin".to_string(), "user".to_string()],
-            active: true,
-        };
-
-        let user_bytes = bincode::serialize(&user)?;
-        self.db.insert(username.as_bytes(), user_bytes)?;
-        self.db.flush()?; // Ensure data is written to disk
-
-        Ok(())
+        self.add_user(username, password, vec!["admin".to_string(), "user".to_string()]).await
     }
 
     /// Check if an admin user exists in the database
-    pub fn has_admin(&self) -> Result<bool> {
-        for item in self.db.iter() {
-            let (_, user_bytes) = item?;
-            let user: User = bincode::deserialize(&user_bytes)?;
-            if user.roles.contains(&"admin".to_string()) {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+    pub async fn has_admin(&self) -> Result<bool> {
+        let row = sqlx::query("SELECT 1 FROM users WHERE roles LIKE '%admin%' LIMIT 1")
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.is_some())
     }
 
     /// Hash a password securely using Argon2
@@ -109,20 +121,34 @@ impl AuthManager {
     }
 
     /// Authenticate user and return JWT token
-    pub fn authenticate(&self, username: &str, password: &str) -> Result<String> {
-        let user_bytes = self.db.get(username.as_bytes())?
-            .ok_or_else(|| anyhow!("User not found"))?;
-
-        let user: User = bincode::deserialize(&user_bytes)?;
+    pub async fn authenticate(&self, username: &str, password: &str) -> Result<String> {
+        let user = self.get_user(username).await?;
 
         if !user.active {
             return Err(anyhow!("User account is disabled"));
         }
 
+        // Check lockout status
+        if let Some((_, Some(until))) = self.login_attempts.get(username).map(|v| *v) {
+            if until > Instant::now() {
+                warn!("Locked account login attempt: {}", username);
+                return Err(anyhow!("Account temporarily locked"));
+            }
+        }
+
         if !Self::verify_password(password, &user.password_hash)? {
             warn!("Failed authentication attempt for user: {}", username);
+            let mut entry = self.login_attempts.entry(username.to_string()).or_insert((0, None));
+            entry.0 += 1;
+            if entry.0 >= self.max_login_attempts {
+                entry.1 = Some(Instant::now() + self.lockout_duration);
+                warn!("User {} locked out due to too many attempts", username);
+            }
             return Err(anyhow!("Invalid credentials"));
         }
+
+        // Successful authentication resets attempt counter
+        self.login_attempts.remove(username);
 
         info!("Successful authentication for user: {}", username);
         self.generate_token(&user)
@@ -141,7 +167,7 @@ impl AuthManager {
         };
 
         let header = Header::new(Algorithm::HS256);
-        let encoding_key = EncodingKey::from_secret(self.jwt_secret.as_ref());
+        let encoding_key = EncodingKey::from_secret(self.jwt_secret.expose_secret().as_ref());
 
         encode(&header, &claims, &encoding_key)
             .map_err(|e| anyhow!("Token generation failed: {}", e))
@@ -149,7 +175,11 @@ impl AuthManager {
 
     /// Validate JWT token and extract claims
     pub fn validate_token(&self, token: &str) -> Result<Claims> {
-        let decoding_key = DecodingKey::from_secret(self.jwt_secret.as_ref());
+        if self.is_token_revoked(token) {
+            return Err(anyhow!("Token has been revoked"));
+        }
+
+        let decoding_key = DecodingKey::from_secret(self.jwt_secret.expose_secret().as_ref());
         let validation = Validation::new(Algorithm::HS256);
 
         let token_data = decode::<Claims>(token, &decoding_key, &validation)
@@ -158,56 +188,95 @@ impl AuthManager {
         Ok(token_data.claims)
     }
 
+    /// Revoke a token by adding it to the blacklist until its expiry
+    pub fn revoke_token(&self, token: &str) -> Result<()> {
+        let decoding_key = DecodingKey::from_secret(self.jwt_secret.expose_secret().as_ref());
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.validate_exp = false;
+        let data = decode::<Claims>(token, &decoding_key, &validation)
+            .map_err(|e| anyhow!("Invalid token: {}", e))?;
+        self.token_blacklist.insert(token.to_string(), data.claims.exp);
+        Ok(())
+    }
+
+    fn is_token_revoked(&self, token: &str) -> bool {
+        let now = chrono::Utc::now().timestamp() as usize;
+        if let Some(exp) = self.token_blacklist.get(token).map(|v| *v) {
+            if exp > now {
+                return true;
+            }
+            self.token_blacklist.remove(token);
+        }
+        false
+    }
+
     /// Check if user has required role
     pub fn has_role(&self, claims: &Claims, required_role: &str) -> bool {
         claims.roles.contains(&required_role.to_string())
     }
 
     /// Add new user (admin only)
-    pub fn add_user(&self, username: String, password: &str, roles: Vec<String>) -> Result<()> {
-        if self.db.contains_key(username.as_bytes())? {
-            return Err(anyhow!("User already exists"));
-        }
-
+    pub async fn add_user(&self, username: String, password: &str, roles: Vec<String>) -> Result<()> {
         let password_hash = Self::hash_password(password)?;
-        let user = User {
-            id: username.clone(),
-            username: username.clone(),
-            password_hash,
-            roles,
-            active: true,
-        };
-
-        let user_bytes = bincode::serialize(&user)?;
-        self.db.insert(username.as_bytes(), user_bytes)?;
-        self.db.flush()?;
+        let roles_json = serde_json::to_string(&roles)?;
+        sqlx::query("INSERT INTO users (id, username, password_hash, roles, active) VALUES (?, ?, ?, ?, 1)")
+            .bind(&username)
+            .bind(&username)
+            .bind(&password_hash)
+            .bind(&roles_json)
+            .execute(&self.pool)
+            .await?;
+        let user = User { id: username.clone(), username: username.clone(), password_hash, roles, active: true };
+        self.cache.insert(username, user);
         Ok(())
     }
 
     /// Update user password
-    pub fn update_password(&self, username: &str, new_password: &str) -> Result<()> {
-        let mut user = self.get_user(username)?;
+    pub async fn update_password(&self, username: &str, new_password: &str) -> Result<()> {
+        let mut user = self.get_user(username).await?;
         user.password_hash = Self::hash_password(new_password)?;
-        self.update_user(&user)
+        self.update_user(&user).await
     }
 
     /// Disable user account
-    pub fn disable_user(&self, username: &str) -> Result<()> {
-        let mut user = self.get_user(username)?;
+    pub async fn disable_user(&self, username: &str) -> Result<()> {
+        let mut user = self.get_user(username).await?;
         user.active = false;
-        self.update_user(&user)
+        self.update_user(&user).await
     }
 
-    fn get_user(&self, username: &str) -> Result<User> {
-        let user_bytes = self.db.get(username)?.ok_or_else(|| anyhow!("User not found"))?;
-        let user: User = bincode::deserialize(&user_bytes)?;
+    async fn get_user(&self, username: &str) -> Result<User> {
+        if let Some(user) = self.cache.get(username).map(|u| u.clone()) {
+            return Ok(user);
+        }
+        let row = sqlx::query("SELECT id, username, password_hash, roles, active FROM users WHERE username = ?")
+            .bind(username)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|_| anyhow!("User not found"))?;
+        let roles: Vec<String> = serde_json::from_str(row.get::<String, _>("roles").as_str())?;
+        let active: bool = row.get::<i64, _>("active") != 0;
+        let user = User {
+            id: row.get("id"),
+            username: row.get("username"),
+            password_hash: row.get("password_hash"),
+            roles,
+            active,
+        };
+        self.cache.insert(user.username.clone(), user.clone());
         Ok(user)
     }
 
-    fn update_user(&self, user: &User) -> Result<()> {
-        let user_bytes = bincode::serialize(user)?;
-        self.db.insert(user.username.as_bytes(), user_bytes)?;
-        self.db.flush()?;
+    async fn update_user(&self, user: &User) -> Result<()> {
+        let roles_json = serde_json::to_string(&user.roles)?;
+        sqlx::query("UPDATE users SET password_hash = ?, roles = ?, active = ? WHERE username = ?")
+            .bind(&user.password_hash)
+            .bind(&roles_json)
+            .bind(if user.active { 1 } else { 0 })
+            .bind(&user.username)
+            .execute(&self.pool)
+            .await?;
+        self.cache.insert(user.username.clone(), user.clone());
         Ok(())
     }
 }
@@ -294,11 +363,9 @@ pub struct LoginResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
-    fn create_test_auth_manager() -> AuthManager {
-        let dir = tempdir().unwrap();
-        AuthManager::new("test_secret".to_string(), dir.path().to_str().unwrap()).unwrap()
+    async fn create_test_auth_manager() -> AuthManager {
+        AuthManager::new(Secret::new("test_secret".to_string()), "sqlite::memory:", &SecurityConfig::default()).await.unwrap()
     }
 
     #[test]
@@ -309,37 +376,33 @@ mod tests {
         assert!(!AuthManager::verify_password("wrong_password", &hash).unwrap());
     }
 
-    #[test]
-    fn test_user_management() {
-        let auth_manager = create_test_auth_manager();
+    #[tokio::test]
+    async fn test_user_management() {
+        let auth_manager = create_test_auth_manager().await;
         let username = "test_user".to_string();
         let password = "test_password_123!";
         let roles = vec!["user".to_string()];
 
-        // Add user
-        auth_manager.add_user(username.clone(), password, roles.clone()).unwrap();
+        auth_manager.add_user(username.clone(), password, roles.clone()).await.unwrap();
 
-        // Authenticate user
-        let token = auth_manager.authenticate(&username, password).unwrap();
+        let token = auth_manager.authenticate(&username, password).await.unwrap();
         let claims = auth_manager.validate_token(&token).unwrap();
         assert_eq!(claims.sub, username);
         assert_eq!(claims.roles, roles);
 
-        // Disable user
-        auth_manager.disable_user(&username).unwrap();
-        let err = auth_manager.authenticate(&username, password).unwrap_err();
+        auth_manager.disable_user(&username).await.unwrap();
+        let err = auth_manager.authenticate(&username, password).await.unwrap_err();
         assert_eq!(err.to_string(), "User account is disabled");
     }
 
-    #[test]
-    fn test_admin_initialization() {
-        let auth_manager = create_test_auth_manager();
-        assert!(!auth_manager.has_admin().unwrap());
+    #[tokio::test]
+    async fn test_admin_initialization() {
+        let auth_manager = create_test_auth_manager().await;
+        assert!(!auth_manager.has_admin().await.unwrap());
 
-        auth_manager.initialize_admin("admin".to_string(), "admin_password").unwrap();
-        assert!(auth_manager.has_admin().unwrap());
+        auth_manager.initialize_admin("admin".to_string(), "admin_password").await.unwrap();
+        assert!(auth_manager.has_admin().await.unwrap());
 
-        // Should fail to initialize again
-        assert!(auth_manager.initialize_admin("admin2".to_string(), "admin_password2").is_err());
+        assert!(auth_manager.initialize_admin("admin2".to_string(), "admin_password2").await.is_err());
     }
 }

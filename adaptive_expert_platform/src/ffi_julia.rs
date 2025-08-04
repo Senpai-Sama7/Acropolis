@@ -12,6 +12,7 @@ mod julia_impl {
     use std::sync::Arc;
     use tokio::sync::{mpsc::Sender, oneshot::channel};
     use tracing::{info, error, warn};
+    use libc;
 
     pub struct JuliaTask {
         pub function_name: String,
@@ -52,6 +53,12 @@ mod julia_impl {
         let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<()>>();
 
         std::thread::spawn(move || {
+            // Attempt to isolate network for Julia runtime
+            #[cfg(target_os = "linux")]
+            unsafe {
+                let _ = libc::unshare(libc::CLONE_NEWNET);
+            }
+
             let julia_res = RuntimeBuilder::new().start();
             let mut julia = match julia_res {
                 Ok(julia) => {
@@ -151,6 +158,10 @@ mod julia_impl {
 
         fn agent_type(&self) -> &str {
             "language_model"
+        }
+
+        fn capabilities(&self) -> Vec<String> {
+            vec!["julia_execute".to_string()]
         }
 
         async fn health_check(&self) -> Result<crate::agent::AgentHealth> {

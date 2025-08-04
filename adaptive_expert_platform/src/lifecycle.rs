@@ -11,7 +11,7 @@ use dashmap::DashMap;
 use tokio::process::Command;
 use tracing::{info, warn, error, instrument, debug};
 
-use crate::agent::Agent;
+use crate::agent::{Agent, AgentHealth};
 
 /// Agent lifecycle states
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -237,6 +237,70 @@ impl LifecycleManager {
         self.start_event_cleanup().await;
 
         info!("Agent lifecycle management system started successfully");
+        Ok(())
+    }
+
+    /// Register an already running agent instance
+    pub async fn register_agent_instance(&self, name: &str) -> Result<Uuid> {
+        let id = Uuid::new_v4();
+        let instance = AgentInstance {
+            id,
+            deployment_name: name.to_string(),
+            state: AgentState::Running,
+            started_at: SystemTime::now(),
+            last_health_check: None,
+            health_status: HealthStatus::Healthy,
+            restart_count: 0,
+            resource_usage: ResourceUsage {
+                cpu_percent: 0.0,
+                memory_mb: 0,
+                disk_mb: 0,
+                network_in_mbps: 0.0,
+                network_out_mbps: 0.0,
+            },
+            version: "1.0".to_string(),
+            endpoint: None,
+            metadata: HashMap::new(),
+        };
+        self.instances.insert(id, instance.clone());
+        self.record_event(DeploymentEvent {
+            id: Uuid::new_v4(),
+            deployment_name: name.to_string(),
+            instance_id: Some(id),
+            event_type: DeploymentEventType::InstanceStarted,
+            timestamp: SystemTime::now(),
+            message: "Agent instance registered".to_string(),
+            metadata: HashMap::new(),
+        }).await;
+        Ok(id)
+    }
+
+    /// Gracefully shutdown a running agent instance
+    pub async fn shutdown_agent(&self, id: Uuid) -> Result<()> {
+        let mut deployment = String::new();
+        if let Some(mut inst) = self.instances.get_mut(&id) {
+            inst.state = AgentState::Stopping;
+            inst.state = AgentState::Stopped;
+            deployment = inst.deployment_name.clone();
+        }
+        self.record_event(DeploymentEvent {
+            id: Uuid::new_v4(),
+            deployment_name: deployment,
+            instance_id: Some(id),
+            event_type: DeploymentEventType::InstanceStopped,
+            timestamp: SystemTime::now(),
+            message: "Agent instance stopped".to_string(),
+            metadata: HashMap::new(),
+        }).await;
+        Ok(())
+    }
+
+    /// Shutdown all registered agent instances
+    pub async fn shutdown_all(&self) -> Result<()> {
+        let ids: Vec<Uuid> = self.instances.iter().map(|e| *e.key()).collect();
+        for id in ids {
+            let _ = self.shutdown_agent(id).await;
+        }
         Ok(())
     }
 
@@ -793,17 +857,24 @@ impl MockAgent {
 
 #[async_trait::async_trait]
 impl Agent for MockAgent {
-    async fn handle(&self, input: serde_json::Value, _memory: Arc<crate::memory::Memory>) -> Result<String> {
-        // Mock agent response
-        Ok(format!("Mock agent {} processed: {:?}", self.id, input))
-    }
-
     fn name(&self) -> &str {
         &self.config.name
     }
 
-    fn description(&self) -> &str {
-        "Mock agent for lifecycle testing"
+    fn agent_type(&self) -> &str {
+        "mock"
+    }
+
+    fn capabilities(&self) -> Vec<String> {
+        vec!["testing".to_string()]
+    }
+
+    async fn handle(&self, input: serde_json::Value, _memory: Arc<crate::memory::Memory>) -> Result<String> {
+        Ok(format!("Mock agent {} processed: {:?}", self.id, input))
+    }
+
+    async fn health_check(&self) -> Result<AgentHealth> {
+        Ok(AgentHealth::default())
     }
 }
 
