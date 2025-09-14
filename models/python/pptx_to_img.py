@@ -6,7 +6,7 @@ import os
 import shutil
 import subprocess
 import tempfile
-from typing import Any, Sequence, cast, List, Dict
+from typing import Any, cast, Dict, List, Sequence
 
 import numpy as np
 from pdf2image import convert_from_path
