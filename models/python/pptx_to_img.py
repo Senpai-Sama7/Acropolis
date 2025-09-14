@@ -3,9 +3,10 @@
 
 import argparse
 import os
+import shutil
 import subprocess
 import tempfile
-from typing import Any, Sequence, cast, List, Tuple, Dict
+from typing import Any, Sequence, cast, List, Dict
 
 import numpy as np
 from pdf2image import convert_from_path
@@ -244,7 +245,6 @@ def main() -> None:
         )
     else:
         # Clean up temp directory if there are no failures
-        import shutil
         shutil.rmtree(overflow_results["temp_directory"])
 
     # Final rasterization of the original presentation
